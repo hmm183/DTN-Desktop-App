@@ -42,10 +42,13 @@ class DesktopMultiTransportManager(
         onPeerStatusChanged = { id, online, link -> updatePeer(id, online, link) }
     )
 
+    var onRelayConnected: (() -> Unit)? = null
+
     val internet = DesktopInternetTransportAdapter(
         localNodeId = localNodeId,
         onMessageReceived = { msg, via -> onInboundBundle(msg, via) },
-        onPeerStatusChanged = { id, online, link -> updatePeer(id, online, link) }
+        onPeerStatusChanged = { id, online, link -> updatePeer(id, online, link) },
+        onRelayConnected = { onRelayConnected?.invoke() }
     )
 
     private val _onlinePeers = MutableStateFlow<Map<String, PeerEndpoint>>(emptyMap())

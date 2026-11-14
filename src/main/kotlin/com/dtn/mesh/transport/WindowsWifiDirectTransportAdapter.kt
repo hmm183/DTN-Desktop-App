@@ -6,12 +6,16 @@ import com.dtn.mesh.receiver.DtnWireCodec
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.InputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -20,10 +24,12 @@ import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Windows Wi-Fi Direct Transport Adapter.
+ * Windows Wi-Fi Direct & LAN Subnet Transport Adapter.
  *
- * Runs a ServerSocket on port 9734 to accept high-speed bulk queue sync connections
- * from Android phones and other desktop peers.
+ * Implements:
+ * 1. TCP Server on port 9734 matching Android's exact framing:
+ *    [4B wireLength][wire bytes][4B idLen][sender node id]
+ * 2. UDP Subnet Beaconing on port 9734 to auto-discover peers when on the same Wi-Fi router.
  */
 class WindowsWifiDirectTransportAdapter(
     private val localNodeId: NodeId,
@@ -40,32 +46,40 @@ class WindowsWifiDirectTransportAdapter(
     val connectedPeers: StateFlow<Map<String, String>> = _connectedPeers.asStateFlow()
 
     private var serverSocket: ServerSocket? = null
+    private var udpSocket: DatagramSocket? = null
     private val activeSockets = ConcurrentHashMap<String, Socket>()
 
     fun start() {
         scope.launch {
-            startServer()
+            startTcpServer()
+        }
+        scope.launch {
+            startUdpBeaconListener()
+        }
+        scope.launch {
+            udpBeaconBroadcastLoop()
         }
     }
 
     fun stop() {
         _isListening.value = false
         runCatching { serverSocket?.close() }
+        runCatching { udpSocket?.close() }
         activeSockets.values.forEach { runCatching { it.close() } }
         activeSockets.clear()
     }
 
-    private fun startServer() {
+    private fun startTcpServer() {
         try {
             val ss = ServerSocket(listenPort)
             serverSocket = ss
             _isListening.value = true
-            println("[WifiDirect] Listening for P2P connections on port $listenPort")
+            println("[WifiDirect] TCP Server listening on port $listenPort")
 
             while (scope.isActive && !ss.isClosed) {
                 try {
                     val client = ss.accept()
-                    client.soTimeout = 10000
+                    client.soTimeout = 15000
                     scope.launch {
                         handleClient(client)
                     }
@@ -74,8 +88,93 @@ class WindowsWifiDirectTransportAdapter(
                 }
             }
         } catch (e: Exception) {
-            println("[WifiDirect] Server error: ${e.message}")
+            println("[WifiDirect] TCP Server error: ${e.message}")
         }
+    }
+
+    private fun startUdpBeaconListener() {
+        try {
+            val udp = DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(listenPort))
+            }
+            udpSocket = udp
+            val buf = ByteArray(128)
+            println("[WifiDirect] UDP Beacon listener bound to port $listenPort")
+
+            while (scope.isActive && !udp.isClosed) {
+                try {
+                    val packet = DatagramPacket(buf, buf.size)
+                    udp.receive(packet)
+                    if (packet.length >= 8 && buf[0] == 0xD7.toByte() && buf[1] == 0x02.toByte()) {
+                        val bb = ByteBuffer.wrap(buf, 2, packet.length - 2).order(ByteOrder.BIG_ENDIAN)
+                        val peerNodeNum = bb.int
+                        val peerPort = bb.short.toInt() and 0xFFFF
+                        val peerHex = String.format("%08x", peerNodeNum)
+                        val peerId = "!$peerHex"
+
+                        if (peerId != localNodeId.value) {
+                            val peerIp = packet.address.hostAddress
+                            val current = _connectedPeers.value.toMutableMap()
+                            if (current[peerId] != peerIp) {
+                                current[peerId] = peerIp
+                                _connectedPeers.value = current
+                                onPeerStatusChanged(peerId, true, "Local Wi-Fi ($peerIp)")
+                                println("[WifiDirect] Heard LAN beacon from $peerId at $peerIp:$peerPort")
+
+                                // Trigger HELLO handshake
+                                scope.launch {
+                                    sendHello(peerIp, peerPort)
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        } catch (e: Exception) {
+            println("[WifiDirect] UDP listener notice: ${e.message}")
+        }
+    }
+
+    private suspend fun udpBeaconBroadcastLoop() {
+        delay(1000)
+        while (scope.isActive) {
+            try {
+                val socket = DatagramSocket()
+                socket.broadcast = true
+                val buf = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN)
+                buf.put(0xD7.toByte())
+                buf.put(0x02.toByte())
+                buf.putInt(localNodeId.toNodeNum32())
+                buf.putShort(listenPort.toShort())
+
+                val bytes = buf.array()
+                val broadcastAddr = InetAddress.getByName("255.255.255.255")
+                val packet = DatagramPacket(bytes, bytes.size, broadcastAddr, listenPort)
+                socket.send(packet)
+                socket.close()
+            } catch (_: Exception) {}
+            delay(5000)
+        }
+    }
+
+    private fun sendHello(targetIp: String, port: Int) {
+        try {
+            val socket = Socket()
+            socket.connect(InetSocketAddress(targetIp, port), 2000)
+            val os = socket.getOutputStream()
+
+            val idBytes = localNodeId.value.toByteArray(Charsets.UTF_8)
+            val hello = ByteBuffer.allocate(8 + idBytes.size).order(ByteOrder.BIG_ENDIAN)
+            hello.putInt(0) // wireLen = 0 (HELLO)
+            hello.putInt(idBytes.size)
+            hello.put(idBytes)
+            os.write(hello.array())
+            os.flush()
+            socket.close()
+        } catch (_: Exception) {}
     }
 
     private fun handleClient(socket: Socket) {
@@ -85,16 +184,14 @@ class WindowsWifiDirectTransportAdapter(
             val outStream = socket.getOutputStream()
 
             // Mutual HELLO exchange: [4B wireLen][wire][4B idLen][id]
-            // Send our HELLO
             val idBytes = localNodeId.value.toByteArray(Charsets.UTF_8)
             val hello = ByteBuffer.allocate(8 + idBytes.size).order(ByteOrder.BIG_ENDIAN)
-            hello.putInt(0) // wireLen = 0 means HELLO
+            hello.putInt(0)
             hello.putInt(idBytes.size)
             hello.put(idBytes)
             outStream.write(hello.array())
             outStream.flush()
 
-            // Read peer's HELLO
             val lenBuf = ByteArray(8)
             if (readFully(inStream, lenBuf, 8)) {
                 val bb = ByteBuffer.wrap(lenBuf).order(ByteOrder.BIG_ENDIAN)
@@ -110,7 +207,6 @@ class WindowsWifiDirectTransportAdapter(
                         _connectedPeers.value = updated
                         onPeerStatusChanged(peerId, true, "Wi-Fi Direct ($remoteIp)")
 
-                        // Read any subsequent bundle
                         if (wireLen > 0) {
                             val wire = ByteArray(wireLen)
                             if (readFully(inStream, wire, wireLen)) {

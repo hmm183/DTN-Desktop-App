@@ -45,11 +45,16 @@ class DesktopOrchestrator(
     val activeStrategy: StateFlow<StrategyType> = _activeStrategy.asStateFlow()
 
     fun start() {
+        transportManager.onRelayConnected = {
+            broadcastAnnounce()
+        }
         transportManager.startAll()
         scope.launch {
             flushLoop()
         }
         scope.launch {
+            delay(1000)
+            broadcastAnnounce()
             periodicAnnounceLoop()
         }
         lifecycleLog.logConsole("Orchestrator", "Desktop Orchestrator started for node ${identity.nodeId}")
@@ -194,9 +199,22 @@ class DesktopOrchestrator(
         val isBroadcast = bundle.destinationNodeId == NodeId.BROADCAST
 
         if (isForMe || isBroadcast) {
+            val contact = database.contacts.value.firstOrNull { it.nodeId == bundle.originNodeId.value }
+
+            // Auto-discover sender if not already known
+            if (contact == null && !isBroadcast) {
+                database.upsertContact(
+                    Contact(
+                        nodeId = bundle.originNodeId.value,
+                        announceName = "Peer ${bundle.originNodeId.value.takeLast(4)}",
+                        keyVerified = false,
+                        keyFirstSeenMs = System.currentTimeMillis()
+                    )
+                )
+            }
+
             // Decrypt payload
             val text: String
-            val contact = database.contacts.value.firstOrNull { it.nodeId == bundle.originNodeId.value }
 
             if (bundle.flags == DtnCrypto.SUITE_DM && contact?.xPub != null) {
                 text = try {
@@ -258,6 +276,15 @@ class DesktopOrchestrator(
             messageType = DtnMessageType.ROUTING_ACK
         )
         transportManager.transmitBundle(ackBundle)
+    }
+
+    fun flushQueueNow() {
+        scope.launch {
+            val buffered = database.bufferedMessages.value
+            for (msg in buffered) {
+                transportManager.transmitBundle(msg)
+            }
+        }
     }
 
     private suspend fun flushLoop() {
