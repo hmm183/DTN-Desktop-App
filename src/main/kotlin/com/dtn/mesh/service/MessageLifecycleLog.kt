@@ -17,6 +17,23 @@ enum class LifecycleEvent {
     CREATED, BUFFERED, FORWARDED, FORWARDING, DELIVERED, EXPIRED, DROPPED, ACK_RECEIVED, BUFFER_CLEARED, DUPLICATE, HOP_LIMIT, IGNORED, ACK_GENERATED
 }
 
+enum class DiagLevel { DEBUG, INFO, WARN, ERROR }
+
+data class DiagLine(
+    val atMs: Long,
+    val level: DiagLevel,
+    val source: String,
+    val text: String
+)
+
+data class LevelCounts(
+    val all: Int = 0,
+    val info: Int = 0,
+    val warn: Int = 0,
+    val error: Int = 0,
+    val debug: Int = 0
+)
+
 data class LifecycleEntry(
     val timestamp: String,
     val event: LifecycleEvent,
@@ -73,6 +90,12 @@ class MessageLifecycleLog(
     private val _console = MutableStateFlow<List<String>>(emptyList())
     val console: StateFlow<List<String>> = _console.asStateFlow()
 
+    private val _diagLines = MutableStateFlow<List<DiagLine>>(emptyList())
+    val diagLines: StateFlow<List<DiagLine>> = _diagLines.asStateFlow()
+
+    private val _counts = MutableStateFlow(LevelCounts())
+    val counts: StateFlow<LevelCounts> = _counts.asStateFlow()
+
     private val journalFile = File(storageDir, "message_journal_v1.log")
 
     init {
@@ -99,13 +122,31 @@ class MessageLifecycleLog(
         }
     }
 
-    fun logConsole(tag: String, text: String) {
-        val line = "[${timeFormat.format(Date())}] [$tag] $text"
-        println(line)
+    fun logDiag(level: DiagLevel, source: String, text: String) {
+        val now = System.currentTimeMillis()
+        val line = DiagLine(now, level, source, text)
+        val formatted = "[${timeFormat.format(Date(now))}] ${level.name} $source · $text"
+        println(formatted)
         synchronized(this) {
-            _console.value = (listOf(line) + _console.value).take(500)
+            val updated = (listOf(line) + _diagLines.value).take(1500)
+            _diagLines.value = updated
+            _counts.value = LevelCounts(
+                all = updated.size,
+                info = updated.count { it.level == DiagLevel.INFO },
+                warn = updated.count { it.level == DiagLevel.WARN },
+                error = updated.count { it.level == DiagLevel.ERROR },
+                debug = updated.count { it.level == DiagLevel.DEBUG }
+            )
+            _console.value = (listOf(formatted) + _console.value).take(500)
         }
     }
+
+    fun d(source: String, text: String) = logDiag(DiagLevel.DEBUG, source, text)
+    fun i(source: String, text: String) = logDiag(DiagLevel.INFO, source, text)
+    fun w(source: String, text: String) = logDiag(DiagLevel.WARN, source, text)
+    fun e(source: String, text: String) = logDiag(DiagLevel.ERROR, source, text)
+
+    fun logConsole(tag: String, text: String) = i(tag, text)
 
     fun recordRoute(route: RouteRecord) {
         synchronized(this) {

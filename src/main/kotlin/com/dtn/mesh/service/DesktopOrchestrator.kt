@@ -38,7 +38,8 @@ class DesktopOrchestrator(
 
     val transportManager = DesktopMultiTransportManager(
         localNodeId = identity.nodeId,
-        onInboundBundle = { bundle, via -> onInboundBundle(bundle, via) }
+        onInboundBundle = { bundle, via -> onInboundBundle(bundle, via) },
+        lifecycleLog = lifecycleLog
     )
 
     private val _activeStrategy = MutableStateFlow(StrategyType.EPIDEMIC)
@@ -167,6 +168,7 @@ class DesktopOrchestrator(
 
         // 4. Save to store-carry-forward buffer
         database.storeBufferedMessage(bundle)
+        lifecycleLog.i("App", "User sent message ${msgId.take(8)} to ${destination.value} (${text.length} chars)")
         lifecycleLog.logEvent(LifecycleEvent.CREATED, msgId, identity.nodeId.value, destination.value, "User sent")
 
         // 5. Immediate opportunistic send
@@ -174,7 +176,10 @@ class DesktopOrchestrator(
             val sent = transportManager.transmitBundle(bundle)
             if (sent) {
                 database.updateChatStatus(msgId, "SENT")
+                lifecycleLog.i("Routing", "Dispatched bundle ${msgId.take(8)} across local/relay transports")
                 lifecycleLog.logEvent(LifecycleEvent.FORWARDING, msgId, identity.nodeId.value, destination.value, "Transmitted via transport")
+            } else {
+                lifecycleLog.d("Routing", "Bundle ${msgId.take(8)} stored in carry-buffer waiting for next peer encounter")
             }
         }
 
@@ -183,9 +188,13 @@ class DesktopOrchestrator(
 
     private fun onInboundBundle(bundle: DtnMessage, via: String) {
         // Prevent duplicate processing
-        if (database.isSeen(bundle.id)) return
+        if (database.isSeen(bundle.id)) {
+            lifecycleLog.d("Routing", "Dropped duplicate bundle ${bundle.id.take(8)} from ${bundle.originNodeId.value}")
+            return
+        }
         database.markSeen(bundle.id)
 
+        lifecycleLog.i("Routing", "Inbound ${bundle.messageType.name} ${bundle.id.take(8)} from ${bundle.originNodeId.value} to ${bundle.destinationNodeId.value} via $via (${bundle.payloadBytes.size} B)")
         lifecycleLog.logEvent(LifecycleEvent.BUFFERED, bundle.id, bundle.originNodeId.value, bundle.destinationNodeId.value, "via $via")
 
         when (bundle.messageType) {
@@ -205,7 +214,7 @@ class DesktopOrchestrator(
     private fun handleAnnounce(bundle: DtnMessage) {
         val payload = Announce.parseAndVerify(bundle.payloadBytes)
         if (payload != null) {
-            println("[Orchestrator] Verified signed announce from ${bundle.originNodeId} (name: ${payload.name})")
+            lifecycleLog.i("Crypto", "Verified signed ED25519 announce from ${bundle.originNodeId.value} ('${payload.name}')")
             database.upsertContact(
                 Contact(
                     nodeId = bundle.originNodeId.value,
@@ -225,6 +234,8 @@ class DesktopOrchestrator(
             if (wantsReply || isDirect || (now - lastSent > 60_000L)) {
                 sendAnnounceTo(bundle.originNodeId)
             }
+        } else {
+            lifecycleLog.w("Crypto", "Received unverified announce packet from ${bundle.originNodeId.value}")
         }
     }
 

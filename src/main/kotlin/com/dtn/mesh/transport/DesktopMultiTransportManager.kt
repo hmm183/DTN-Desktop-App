@@ -7,6 +7,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ConcurrentHashMap
 
+import com.dtn.mesh.service.MessageLifecycleLog
+
 data class PeerEndpoint(
     val nodeId: String,
     val isOnline: Boolean,
@@ -17,6 +19,7 @@ data class PeerEndpoint(
 class DesktopMultiTransportManager(
     val localNodeId: NodeId,
     private val onInboundBundle: (DtnMessage, String) -> Unit,
+    val lifecycleLog: MessageLifecycleLog? = null,
 ) {
     val usbSerial = UsbSerialTransportAdapter(
         localNodeId = localNodeId,
@@ -33,7 +36,8 @@ class DesktopMultiTransportManager(
     val ble = WindowsBleTransportAdapter(
         localNodeId = localNodeId,
         onMessageReceived = { msg, via -> onInboundBundle(msg, via) },
-        onPeerStatusChanged = { id, online, link -> updatePeer(id, online, link) }
+        onPeerStatusChanged = { id, online, link -> updatePeer(id, online, link) },
+        lifecycleLog = lifecycleLog
     )
 
     val wifiDirect = WindowsWifiDirectTransportAdapter(

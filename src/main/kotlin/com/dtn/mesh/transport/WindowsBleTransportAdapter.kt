@@ -14,6 +14,8 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import com.dtn.mesh.service.DiagLevel
+import com.dtn.mesh.service.MessageLifecycleLog
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.File
@@ -36,6 +38,7 @@ class WindowsBleTransportAdapter(
     private val localNodeId: NodeId,
     private val onMessageReceived: (DtnMessage, String) -> Unit,
     private val onPeerStatusChanged: (String, Boolean, String) -> Unit,
+    val lifecycleLog: MessageLifecycleLog? = null,
 ) {
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("d791b000-2c8f-4f2a-9b1e-000000000001")
@@ -117,6 +120,18 @@ class WindowsBleTransportAdapter(
             val event = root["event"]?.jsonPrimitive?.content ?: return
 
             when (event) {
+                "log" -> {
+                    val src = root["source"]?.jsonPrimitive?.content ?: "BLE"
+                    val lvl = root["level"]?.jsonPrimitive?.content ?: "INFO"
+                    val txt = root["text"]?.jsonPrimitive?.content ?: ""
+                    val diagLevel = when (lvl.uppercase()) {
+                        "DEBUG" -> DiagLevel.DEBUG
+                        "WARN" -> DiagLevel.WARN
+                        "ERROR" -> DiagLevel.ERROR
+                        else -> DiagLevel.INFO
+                    }
+                    lifecycleLog?.logDiag(diagLevel, src, txt)
+                }
                 "discovered" -> {
                     val nodeId = root["nodeId"]?.jsonPrimitive?.content ?: return
                     val mac = root["mac"]?.jsonPrimitive?.content ?: ""
@@ -126,6 +141,7 @@ class WindowsBleTransportAdapter(
                     current[nodeId] = mac
                     _discoveredPeers.value = current
                     onPeerStatusChanged(nodeId, true, "BLE ($rssi dBm)")
+                    lifecycleLog?.i("BLE", "Discovered peer $nodeId (MAC $mac, RSSI $rssi dBm)")
                 }
                 "bundle" -> {
                     val wireB64 = root["wireBase64"]?.jsonPrimitive?.content ?: return
@@ -133,37 +149,58 @@ class WindowsBleTransportAdapter(
                     val wireBytes = Base64.getDecoder().decode(wireB64)
                     val bundle = DtnWireCodec.decode(wireBytes, rssi = rssi, snr = 10f)
                     if (bundle != null && bundle.originNodeId != localNodeId) {
+                        lifecycleLog?.i("BLE", "Inbound bundle received: ${bundle.id.take(8)} from ${bundle.originNodeId.value} (${wireBytes.size} B, RSSI $rssi dBm)")
                         onMessageReceived(bundle, "BLE")
+                    } else if (bundle != null) {
+                        lifecycleLog?.d("BLE", "Ignored bundle ${bundle.id.take(8)} originated from self")
                     }
                 }
                 "status" -> {
                     val available = root["available"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: true
                     _isBleAvailable.value = available
                     val msg = root["message"]?.jsonPrimitive?.content ?: ""
-                    println("[WindowsBle] Worker status: available=$available ($msg)")
+                    lifecycleLog?.i("BLE", "Worker status: available=$available ($msg)")
                 }
                 "error" -> {
                     val err = root["error"]?.jsonPrimitive?.content ?: ""
-                    println("[WindowsBle] Worker notice: $err")
+                    lifecycleLog?.w("BLE", "Worker notice: $err")
+                }
+                "linkUp" -> {
+                    val mac = root["mac"]?.jsonPrimitive?.content ?: ""
+                    lifecycleLog?.i("BLE", "GATT link confirmed with $mac: subscribed to indications & BleHello ACKed")
+                }
+                "sent" -> {
+                    val nodeId = root["nodeId"]?.jsonPrimitive?.content ?: ""
+                    val success = root["success"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: false
+                    val error = root["error"]?.jsonPrimitive?.content ?: ""
+                    if (success) {
+                        lifecycleLog?.i("BLE", "Bundle successfully delivered to $nodeId via GATT write")
+                    } else {
+                        lifecycleLog?.w("BLE", "Bundle delivery failed to $nodeId: $error")
+                    }
                 }
             }
         } catch (_: Exception) {}
     }
 
     fun sendBundle(bundle: DtnMessage, targetPeerId: String): Boolean {
-        val writer = workerWriter ?: return false
+        val writer = workerWriter ?: run {
+            lifecycleLog?.w("BLE", "Cannot send bundle: BLE worker process not active")
+            return false
+        }
         val mac = _discoveredPeers.value[targetPeerId] ?: ""
         return try {
             val wire = DtnWireCodec.encode(bundle)
             val b64 = Base64.getEncoder().encodeToString(wire)
             val cmd = "{\"cmd\":\"send\",\"nodeId\":\"$targetPeerId\",\"mac\":\"$mac\",\"wireBase64\":\"$b64\"}\n"
+            lifecycleLog?.d("BLE", "Queuing bundle ${bundle.id.take(8)} to $targetPeerId (${wire.size} B via ${if (mac.isNotBlank()) mac else "GATT_CENTRAL"})")
             synchronized(writer) {
                 writer.write(cmd)
                 writer.flush()
             }
             true
         } catch (e: Exception) {
-            println("[WindowsBle] sendBundle failed: ${e.message}")
+            lifecycleLog?.e("BLE", "sendBundle failed to $targetPeerId: ${e.message}")
             false
         }
     }

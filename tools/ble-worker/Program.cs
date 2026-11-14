@@ -21,6 +21,7 @@ public class Program
     private static readonly Guid LinkCharUuid = Guid.Parse("d791b002-2c8f-4f2a-9b1e-000000000001");
 
     private static BluetoothLEAdvertisementWatcher? _watcher;
+    private static BluetoothLEAdvertisementPublisher? _advPublisher;
     private static GattServiceProvider? _serviceProvider;
     private static GattLocalCharacteristic? _bundleCharacteristic;
     private static GattLocalCharacteristic? _linkCharacteristic;
@@ -62,6 +63,7 @@ public class Program
         try
         {
             await InitGattServerAsync();
+            StartBleAdvertising();
             InitScanner();
             EmitJson("status", new JsonObject
             {
@@ -207,6 +209,49 @@ public class Program
             IsDiscoverable = true
         };
         _serviceProvider.StartAdvertising(advParams);
+    }
+
+    private static void StartBleAdvertising()
+    {
+        try
+        {
+            _advPublisher = new BluetoothLEAdvertisementPublisher();
+            _advPublisher.Advertisement.ServiceUuids.Add(ServiceUuid);
+
+            // 128-bit Service Data (DataType 0x21):
+            // 16 bytes Service UUID (in reverse byte order for BLE GAP) + 4 bytes localNodeNum (Big Endian)
+            // Target UUID: d791b000-2c8f-4f2a-9b1e-000000000001
+            byte[] uuidReversed = new byte[16]
+            {
+                0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0x9B,
+                0x2A, 0x4F, 0x8F, 0x2C, 0x00, 0xB0, 0x91, 0xD7
+            };
+            byte[] payload = new byte[20];
+            Array.Copy(uuidReversed, 0, payload, 0, 16);
+            BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(16, 4), _localNodeNum);
+
+            var writer = new DataWriter();
+            writer.WriteBytes(payload);
+            var section = new BluetoothLEAdvertisementDataSection(0x21, writer.DetachBuffer());
+            _advPublisher.Advertisement.DataSections.Add(section);
+
+            _advPublisher.Start();
+            EmitJson("log", new JsonObject
+            {
+                ["source"] = "BLE",
+                ["level"] = "INFO",
+                ["text"] = $"BluetoothLEAdvertisementPublisher active: ServiceData broadcast nodeNum=0x{_localNodeNum:X8}"
+            });
+        }
+        catch (Exception ex)
+        {
+            EmitJson("log", new JsonObject
+            {
+                ["source"] = "BLE",
+                ["level"] = "WARN",
+                ["text"] = $"BluetoothLEAdvertisementPublisher fallback: {ex.Message}"
+            });
+        }
     }
 
     private static async void OnBundleWriteRequested(GattLocalCharacteristic sender, GattWriteRequestedEventArgs args)
@@ -363,8 +408,9 @@ public class Program
                     catch { }
                 };
 
-                // Write BleHello: [0x01][4B localNodeNum BE]
+                // Write BleHello: [0x01][4B localNodeNum BE] in Big Endian
                 var writer = new DataWriter();
+                writer.ByteOrder = ByteOrder.BigEndian;
                 writer.WriteByte(0x01); // VERSION 1
                 writer.WriteInt32(_localNodeNum);
                 await linkChar.WriteValueWithResultAsync(writer.DetachBuffer(), GattWriteOption.WriteWithResponse);
@@ -609,6 +655,7 @@ public class Program
     {
         try
         {
+            _advPublisher?.Stop();
             _watcher?.Stop();
             _serviceProvider?.StopAdvertising();
             foreach (var dev in _connectedCentrals.Values)

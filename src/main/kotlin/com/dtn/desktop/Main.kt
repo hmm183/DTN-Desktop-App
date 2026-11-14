@@ -48,6 +48,8 @@ import com.dtn.mesh.model.DtnMessage
 import com.dtn.mesh.model.NodeId
 import com.dtn.mesh.routing.StrategySelector.StrategyType
 import com.dtn.mesh.service.DesktopOrchestrator
+import com.dtn.mesh.service.DiagLevel
+import com.dtn.mesh.service.DiagLine
 import com.dtn.mesh.service.LifecycleEntry
 import com.dtn.mesh.service.LifecycleEvent
 import com.dtn.mesh.service.MessageLifecycleLog
@@ -2249,14 +2251,14 @@ fun NetworkTopologyView(
             LinkCard("Cloud Relay", "HiveMQ MQTT + Cloudflare", orchestrator.transportManager.internet.isConnected.value, Modifier.weight(1f))
         }
 
-        // ── 2D MESH TOPOLOGY CANVAS GRAPH ────────────────────────────────────
+        // ── ACTIVE PEER REACH MATRIX (Light Theme, Android-Parity) ───────────
         Card(
             shape = DtnShapes.Card,
             colors = CardDefaults.cardColors(containerColor = DtnColors.Card),
             border = BorderStroke(1.dp, DtnColors.CardBorder),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -2264,76 +2266,127 @@ fun NetworkTopologyView(
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Icon(Icons.Filled.Hub, contentDescription = null, tint = DtnColors.Primary)
-                        Text("Live 2D Mesh Topology Canvas", style = DtnType.RowTitle)
+                        Text("Active Peer Reach Matrix", style = DtnType.RowTitle)
                     }
 
-                    Surface(shape = DtnShapes.Pill, color = DtnColors.PrimarySoft) {
-                        Text(
-                            text = "${onlinePeers.size} Discovered Links",
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                            style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold, color = DtnColors.Primary)
-                        )
+                    OutlinedButton(
+                        onClick = {
+                            orchestrator.broadcastAnnounce()
+                            orchestrator.triggerSubnetSweep()
+                        },
+                        shape = DtnShapes.Button,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Scan & Announce", style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.SemiBold))
                     }
                 }
 
-                Text(
-                    "Interactive real-time radar mesh visualization. Nodes orbit the central command station according to active transport rays (Emerald = Wi-Fi :9734, Sky Blue = BLE GATT, Purple = Cloud Relay, Amber = USB LoRa). Tap any node to inspect.",
-                    style = DtnType.Meta
-                )
-
-                MeshTopologyCanvas(
-                    localNodeId = orchestrator.identity.nodeId.value,
-                    onlinePeers = onlinePeers,
-                    contacts = contacts,
-                    selectedPeerId = selectedGraphPeerId,
-                    onSelectPeer = { selectedGraphPeerId = it }
-                )
-
-                // Selected Graph Peer Inspector Banner
-                if (selectedGraphPeerId != null) {
-                    val peer = onlinePeers[selectedGraphPeerId]
-                    val contact = contacts.firstOrNull { it.nodeId == selectedGraphPeerId }
-                    val name = contact?.announceName?.takeIf { it.isNotBlank() } ?: selectedGraphPeerId!!
-
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = DtnColors.Track,
-                        border = BorderStroke(1.dp, DtnColors.Primary.copy(alpha = 0.3f)),
-                        modifier = Modifier.fillMaxWidth()
+                if (onlinePeers.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 32.dp),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(14.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Text(name, style = DtnType.RowTitle.copy(fontSize = 14.sp))
-                                    Surface(shape = DtnShapes.Pill, color = DtnColors.GreenSoft) {
-                                        Text(peer?.linkType ?: "Active Link", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = TextStyle(fontSize = 10.sp, color = DtnColors.GreenText, fontWeight = FontWeight.Bold))
-                                    }
+                            Surface(shape = CircleShape, color = DtnColors.PrimarySoft, modifier = Modifier.size(48.dp)) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(Icons.Filled.Bluetooth, contentDescription = null, tint = DtnColors.Primary, modifier = Modifier.size(24.dp))
                                 }
-                                Text("Node ID: ${selectedGraphPeerId!!} · PRoPHET Predictability: 0.850", style = DtnType.Meta)
                             }
+                            Text("No nearby physical peers in range right now", style = DtnType.RowTitle.copy(fontSize = 14.sp, color = DtnColors.TextSubtitle))
+                            Text("Actively scanning on Bluetooth LE, Wi-Fi Direct (:9734), and Cloud Relay...", style = DtnType.Meta)
+                        }
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        onlinePeers.values.forEach { peer ->
+                            val contact = contacts.firstOrNull { it.nodeId == peer.nodeId }
+                            val displayName = contact?.announceName?.takeIf { it.isNotBlank() } ?: peer.nodeId
+                            val isKeyVerified = contact?.keyVerified == true
 
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(
-                                    onClick = { orchestrator.sendAnnounceTo(NodeId(selectedGraphPeerId!!), wantsReply = true) },
-                                    shape = DtnShapes.Button
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = DtnColors.Track,
+                                border = BorderStroke(1.dp, DtnColors.CardBorder),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(14.dp).fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("Ping Node", style = TextStyle(fontSize = 11.sp))
-                                }
+                                    // Left: Avatar + Names + Connection Tag
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                        Box(contentAlignment = Alignment.BottomEnd) {
+                                            Surface(
+                                                shape = CircleShape,
+                                                color = DtnColors.avatarFor(peer.nodeId),
+                                                modifier = Modifier.size(44.dp)
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Text(
+                                                        displayName.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                                                        style = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                                    )
+                                                }
+                                            }
+                                            Box(modifier = Modifier.size(11.dp).clip(CircleShape).background(DtnColors.Green).border(1.5.dp, Color.White, CircleShape))
+                                        }
 
-                                Button(
-                                    onClick = { onOpenChat(selectedGraphPeerId!!) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = DtnColors.Primary),
-                                    shape = DtnShapes.Button
-                                ) {
-                                    Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = null, modifier = Modifier.size(14.dp))
-                                    Spacer(Modifier.width(4.dp))
-                                    Text("Open Chat", style = TextStyle(fontSize = 11.sp))
+                                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Text(displayName, style = DtnType.RowTitle)
+                                                if (isKeyVerified) {
+                                                    Surface(shape = DtnShapes.Pill, color = DtnColors.GreenSoft) {
+                                                        Text("X25519 E2EE", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = TextStyle(fontSize = 10.sp, fontWeight = FontWeight.Bold, color = DtnColors.GreenText))
+                                                    }
+                                                }
+                                            }
+
+                                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Text(peer.nodeId, style = DtnType.Mono.copy(fontSize = 12.sp, color = DtnColors.Primary))
+                                                Text("•", style = TextStyle(color = DtnColors.TextHint))
+                                                Surface(shape = DtnShapes.Pill, color = DtnColors.PrimarySoft) {
+                                                    Text(peer.linkType, modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp), style = TextStyle(fontSize = 10.sp, color = DtnColors.Primary, fontWeight = FontWeight.SemiBold))
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Right: Actions (Ping + Open Chat)
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                orchestrator.sendTextMessage(NodeId(peer.nodeId), "⚡ Range Ping")
+                                            },
+                                            shape = DtnShapes.Button,
+                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                            modifier = Modifier.height(34.dp)
+                                        ) {
+                                            Icon(Icons.Filled.Bolt, contentDescription = null, modifier = Modifier.size(15.dp), tint = DtnColors.Primary)
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("Ping", style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = DtnColors.Primary))
+                                        }
+
+                                        Button(
+                                            onClick = { onOpenChat(peer.nodeId) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = DtnColors.Primary),
+                                            shape = DtnShapes.Button,
+                                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                            modifier = Modifier.height(34.dp)
+                                        ) {
+                                            Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = null, modifier = Modifier.size(15.dp), tint = Color.White)
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Open Chat", style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color.White))
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2577,31 +2630,31 @@ fun LinkCard(title: String, desc: String, isOnline: Boolean, modifier: Modifier)
     }
 }
 
-// ── FILTERABLE CONSOLE LOG VIEW ──────────────────────────────────────────────
+// ── FILTERABLE CONSOLE LOG VIEW (ANDROID PARITY TERMINAL) ────────────────────
 @Composable
 fun ConsoleLogView(lifecycleLog: MessageLifecycleLog) {
-    val logs by lifecycleLog.console.collectAsState()
-    var selectedTag by remember { mutableStateOf("ALL") }
+    val diagLines by lifecycleLog.diagLines.collectAsState()
+    val counts by lifecycleLog.counts.collectAsState()
+
+    var selectedLevel by remember { mutableStateOf<DiagLevel?>(null) } // null = ALL
+    var selectedSource by remember { mutableStateOf("ALL") }
     var searchQuery by remember { mutableStateOf("") }
+    var copyNotice by remember { mutableStateOf(false) }
+    var clearedAtMs by remember { mutableStateOf(0L) }
 
-    val tags = listOf("ALL", "RELAY", "BLE", "WIFI", "CRYPTO", "ROUTER", "ORCHESTRATOR")
+    val sources = listOf("ALL", "BLE", "WIFI", "RELAY", "ROUTING", "CRYPTO", "APP", "STORAGE")
 
-    val filteredLogs = logs.filter { line ->
-        val matchesTag = when (selectedTag) {
-            "ALL" -> true
-            "RELAY" -> line.contains("[InternetRelay]") || line.contains("[MQTT]")
-            "BLE" -> line.contains("[WindowsBle]") || line.contains("[BLE]")
-            "WIFI" -> line.contains("[WifiDirect]") || line.contains("[LAN]")
-            "CRYPTO" -> line.contains("[Crypto]") || line.contains("[Envelope]") || line.contains("[Ed25519]")
-            "ROUTER" -> line.contains("[Router]") || line.contains("[Routing]")
-            "ORCHESTRATOR" -> line.contains("[Orchestrator]")
-            else -> true
+    val visibleLines = remember(diagLines, selectedLevel, selectedSource, searchQuery, clearedAtMs) {
+        diagLines.filter { line ->
+            (clearedAtMs == 0L || line.atMs > clearedAtMs) &&
+            (selectedLevel == null || line.level == selectedLevel) &&
+            (selectedSource == "ALL" || line.source.equals(selectedSource, ignoreCase = true)) &&
+            (searchQuery.isBlank() || line.text.contains(searchQuery, ignoreCase = true) || line.source.contains(searchQuery, ignoreCase = true))
         }
-        val matchesSearch = searchQuery.isBlank() || line.contains(searchQuery, ignoreCase = true)
-        matchesTag && matchesSearch
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        // Header Row
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -2609,45 +2662,90 @@ fun ConsoleLogView(lifecycleLog: MessageLifecycleLog) {
         ) {
             Column {
                 Text("System Diagnostics & Transport Console", style = DtnType.PageTitle)
-                Text("Real-time subsystem logs and event stream", style = DtnType.PageSubtitle)
+                Text("Android-grade structured telemetry, GATT states, packet traces, and routing logs", style = DtnType.PageSubtitle)
             }
 
-            OutlinedButton(
-                onClick = {
-                    val all = filteredLogs.joinToString("\n")
-                    copyToClipboard(all)
-                },
-                shape = DtnShapes.Button,
-                border = BorderStroke(1.dp, DtnColors.CardBorder)
-            ) {
-                Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Copy Output")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        val allText = visibleLines.joinToString("\n") { l ->
+                            val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date(l.atMs))
+                            "[$time] ${l.level.name}\t${l.source}\t${l.text}"
+                        }
+                        copyToClipboard(allText)
+                        copyNotice = true
+                    },
+                    shape = DtnShapes.Button,
+                    border = BorderStroke(1.dp, DtnColors.CardBorder),
+                    modifier = Modifier.height(36.dp)
+                ) {
+                    Icon(if (copyNotice) Icons.Filled.Check else Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (copyNotice) "Copied!" else "Copy Output", style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold))
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        clearedAtMs = System.currentTimeMillis()
+                    },
+                    shape = DtnShapes.Button,
+                    border = BorderStroke(1.dp, DtnColors.CardBorder),
+                    modifier = Modifier.height(36.dp)
+                ) {
+                    Icon(Icons.Filled.DeleteSweep, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Clear View", style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold))
+                }
             }
         }
 
-        // Tag Filters & Search Row
+        // Severity Level Filter Chips (with live counters)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            tags.forEach { tag ->
-                val isSelected = selectedTag == tag
+            val levelOptions = listOf(
+                null to "All (${counts.all})",
+                DiagLevel.INFO to "Info (${counts.info})",
+                DiagLevel.WARN to "Warnings (${counts.warn})",
+                DiagLevel.ERROR to "Errors (${counts.error})",
+                DiagLevel.DEBUG to "Debug (${counts.debug})"
+            )
+            levelOptions.forEach { (lvl, label) ->
+                val isSelected = selectedLevel == lvl
                 FilterChip(
                     selected = isSelected,
-                    onClick = { selectedTag = tag },
-                    label = { Text(tag, style = TextStyle(fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)) },
+                    onClick = { selectedLevel = lvl },
+                    label = { Text(label, style = TextStyle(fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)) },
                     shape = DtnShapes.Pill
                 )
             }
         }
 
+        // Subsystem Source Chips
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            sources.forEach { src ->
+                val isSelected = selectedSource == src
+                FilterChip(
+                    selected = isSelected,
+                    onClick = { selectedSource = src },
+                    label = { Text(src, style = TextStyle(fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)) },
+                    shape = DtnShapes.Pill
+                )
+            }
+        }
+
+        // Search Bar
         Surface(
             shape = DtnShapes.Field,
             color = DtnColors.Card,
             border = BorderStroke(1.dp, DtnColors.CardBorder),
-            modifier = Modifier.fillMaxWidth().height(40.dp)
+            modifier = Modifier.fillMaxWidth().height(38.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
@@ -2658,7 +2756,7 @@ fun ConsoleLogView(lifecycleLog: MessageLifecycleLog) {
                 TextField(
                     value = searchQuery,
                     onValueChange = { searchQuery = it },
-                    placeholder = { Text("Filter console output...", style = TextStyle(fontSize = 12.sp, color = DtnColors.TextHint)) },
+                    placeholder = { Text("Search logs by keyword, peer ID, message UUID, or error...", style = TextStyle(fontSize = 12.sp, color = DtnColors.TextHint)) },
                     colors = TextFieldDefaults.colors(
                         focusedContainerColor = Color.Transparent,
                         unfocusedContainerColor = Color.Transparent,
@@ -2670,22 +2768,50 @@ fun ConsoleLogView(lifecycleLog: MessageLifecycleLog) {
             }
         }
 
+        // Terminal Surface
         Surface(
             shape = DtnShapes.Card,
             color = DtnColors.Terminal,
             modifier = Modifier.weight(1f).fillMaxWidth()
         ) {
-            if (filteredLogs.isEmpty()) {
+            if (visibleLines.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("No log messages matching filter.", style = TextStyle(fontFamily = FontFamily.Monospace, color = Color(0xFF64748B)))
+                    Text(
+                        if (clearedAtMs > 0L) "View cleared. Incoming log lines will stream here..." else "No log messages match the active filter.",
+                        style = TextStyle(fontFamily = FontFamily.Monospace, color = Color(0xFF64748B), fontSize = 12.sp)
+                    )
                 }
             } else {
-                LazyColumn(modifier = Modifier.fillMaxSize().padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    items(filteredLogs) { log ->
-                        Text(
-                            text = log,
-                            style = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Color(0xFF38BDF8))
-                        )
+                LazyColumn(modifier = Modifier.fillMaxSize().padding(14.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    items(visibleLines) { l ->
+                        val timeStr = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date(l.atMs))
+                        val (levelColor, levelLabel) = when (l.level) {
+                            DiagLevel.INFO -> Color(0xFF67E8F9) to "INFO"
+                            DiagLevel.WARN -> Color(0xFFFBBF24) to "WARN"
+                            DiagLevel.ERROR -> Color(0xFFF87171) to "ERROR"
+                            DiagLevel.DEBUG -> Color(0xFF94A3B8) to "DEBUG"
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.Top,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("[$timeStr]", style = TextStyle(fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = Color(0xFF64748B)))
+                            Text(
+                                levelLabel,
+                                style = TextStyle(fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, color = levelColor)
+                            )
+                            Text(
+                                "${l.source} ·",
+                                style = TextStyle(fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold, color = Color(0xFF94A3B8))
+                            )
+                            Text(
+                                l.text,
+                                style = TextStyle(fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = Color(0xFFE2E8F0)),
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
                     }
                 }
             }
