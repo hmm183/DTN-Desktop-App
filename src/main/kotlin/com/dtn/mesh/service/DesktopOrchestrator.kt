@@ -44,16 +44,30 @@ class DesktopOrchestrator(
     private val _activeStrategy = MutableStateFlow(StrategyType.EPIDEMIC)
     val activeStrategy: StateFlow<StrategyType> = _activeStrategy.asStateFlow()
 
+    private val _discoverMode = MutableStateFlow(true)
+    val discoverMode: StateFlow<Boolean> = _discoverMode.asStateFlow()
+
     private val lastAnnounceSentTo = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    fun setDiscoverMode(enabled: Boolean) {
+        _discoverMode.value = enabled
+        if (enabled) {
+            broadcastAnnounce()
+            lifecycleLog.logConsole("Orchestrator", "Discover Mode enabled: broadcasting presence to mesh")
+        } else {
+            lifecycleLog.logConsole("Orchestrator", "Discover Mode disabled: stealth mode active (unsolicited announcements halted)")
+        }
+    }
 
     fun start() {
         transportManager.onRelayConnected = {
-            broadcastAnnounce()
+            if (_discoverMode.value) broadcastAnnounce()
         }
         transportManager.onPeerDiscovered = { peerId ->
-            // Proactively announce to newly discovered peer
-            scope.launch {
-                sendAnnounceTo(NodeId(peerId))
+            if (_discoverMode.value) {
+                scope.launch {
+                    sendAnnounceTo(NodeId(peerId))
+                }
             }
         }
         transportManager.startAll()
@@ -62,7 +76,7 @@ class DesktopOrchestrator(
         }
         scope.launch {
             delay(1000)
-            broadcastAnnounce()
+            if (_discoverMode.value) broadcastAnnounce()
             periodicAnnounceLoop()
         }
         lifecycleLog.logConsole("Orchestrator", "Desktop Orchestrator started for node ${identity.nodeId}")
@@ -403,8 +417,10 @@ class DesktopOrchestrator(
 
     private suspend fun periodicAnnounceLoop() {
         while (scope.isActive) {
-            broadcastAnnounce()
-            delay(300_000L) // Every 5 minutes
+            delay(45_000L) // Scan & announce every 45s when discover mode is active
+            if (_discoverMode.value) {
+                broadcastAnnounce()
+            }
         }
     }
 
@@ -428,5 +444,16 @@ class DesktopOrchestrator(
             messageType = DtnMessageType.ANNOUNCE
         )
         transportManager.transmitBundle(bundle)
+    }
+
+    fun buildMyInviteLink(): String {
+        val host = "dtnmesh.relaynetwork.workers.dev"
+        val code = com.dtn.mesh.crypto.IdentityQr.build(
+            identity.nodeNum32,
+            identity.xPub,
+            identity.edPub,
+            System.getenv("COMPUTERNAME") ?: "Desktop Station"
+        )
+        return "https://$host/c#$code"
     }
 }

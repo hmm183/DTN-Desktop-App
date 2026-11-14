@@ -218,6 +218,16 @@ class DesktopDatabase(
         reloadChatMessages()
     }
 
+    fun clearConversation(convKey: String) {
+        getConnection().use { conn ->
+            conn.prepareStatement("DELETE FROM chat_messages WHERE conv_key = ?").use { stmt ->
+                stmt.setString(1, convKey)
+                stmt.executeUpdate()
+            }
+        }
+        reloadChatMessages()
+    }
+
     private fun reloadContacts() {
         val list = mutableListOf<Contact>()
         getConnection().use { conn ->

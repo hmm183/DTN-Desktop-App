@@ -20,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -61,11 +62,13 @@ import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
+import com.dtn.desktop.simulation.DiMaxPropSimulationView
 
 enum class DesktopNavTab(val label: String, val icon: ImageVector) {
     CHATS("Chats", Icons.AutoMirrored.Filled.Chat),
     QUEUE("Queue", Icons.Filled.Inbox),
     NETWORK("Network", Icons.Filled.Hub),
+    SIMULATION("DiMaxProp", Icons.Filled.Timeline),
     JOURNAL("Event Log", Icons.Filled.History),
     CONSOLE("Console", Icons.Filled.Terminal)
 }
@@ -158,8 +161,7 @@ fun DesktopAppScreen(
             orchestrator = orchestrator,
             onlinePeersCount = onlinePeers.size,
             activeStrategy = activeStrategy,
-            onSelectStrategy = { orchestrator.setStrategy(it) },
-            onAnnounce = { orchestrator.broadcastAnnounce() }
+            onSelectStrategy = { orchestrator.setStrategy(it) }
         )
 
         HorizontalDivider(thickness = 1.dp, color = DtnColors.CardBorder)
@@ -212,6 +214,13 @@ fun DesktopAppScreen(
                                     },
                                     onMessageClick = { msg ->
                                         inspectingMessage = msg
+                                    },
+                                    onClearChat = {
+                                        database.clearConversation(selectedConvKey)
+                                    },
+                                    onPingPeer = {
+                                        val dest = if (selectedConvKey == "^all") NodeId.BROADCAST else NodeId(selectedConvKey)
+                                        orchestrator.sendTextMessage(dest, "⚡ Mesh Ping from Station ${orchestrator.identity.nodeId.value}")
                                     }
                                 )
                             }
@@ -259,6 +268,9 @@ fun DesktopAppScreen(
                             }
                         )
                     }
+                    DesktopNavTab.SIMULATION -> {
+                        DiMaxPropSimulationView()
+                    }
                     DesktopNavTab.CONSOLE -> {
                         ConsoleLogView(lifecycleLog)
                     }
@@ -287,12 +299,14 @@ fun TopNavigationBar(
     onlinePeersCount: Int,
     activeStrategy: StrategyType,
     onSelectStrategy: (StrategyType) -> Unit,
-    onAnnounce: () -> Unit,
 ) {
     val usbSerialConnected by orchestrator.transportManager.usbSerial.isConnected.collectAsState()
     val bleScanning by orchestrator.transportManager.ble.isScanning.collectAsState()
     val wifiListening by orchestrator.transportManager.wifiDirect.isListening.collectAsState()
     val internetConnected by orchestrator.transportManager.internet.isConnected.collectAsState()
+    val discoverMode by orchestrator.discoverMode.collectAsState()
+
+    var linkCopiedNotification by remember { mutableStateOf(false) }
 
     Surface(
         color = DtnColors.Card,
@@ -363,20 +377,78 @@ fun TopNavigationBar(
                 )
             }
 
-            // Right: Strategy Dropdown + Announce Button
+            // Right: Strategy Selector + Discover Mode Toggle + Share Invite Link
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 StrategySelectorPill(activeStrategy, onSelectStrategy)
 
-                Button(
-                    onClick = onAnnounce,
-                    colors = ButtonDefaults.buttonColors(containerColor = DtnColors.Primary),
+                // Discover Mode Toggle Pill (Replaced Announce button)
+                Surface(
+                    shape = DtnShapes.Pill,
+                    color = if (discoverMode) DtnColors.GreenSoft else DtnColors.GreySoft,
+                    border = BorderStroke(1.dp, if (discoverMode) DtnColors.Green.copy(alpha = 0.4f) else DtnColors.CardBorder),
+                    modifier = Modifier.height(36.dp).clip(DtnShapes.Pill).clickable {
+                        orchestrator.setDiscoverMode(!discoverMode)
+                    }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(if (discoverMode) DtnColors.Green else DtnColors.TextHint)
+                        )
+                        Text(
+                            text = if (discoverMode) "Discover: ON" else "Discover: OFF",
+                            style = TextStyle(
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (discoverMode) DtnColors.GreenText else DtnColors.TextSubtitle
+                            )
+                        )
+                        Switch(
+                            checked = discoverMode,
+                            onCheckedChange = { orchestrator.setDiscoverMode(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = DtnColors.Green,
+                                checkedTrackColor = DtnColors.GreenSoft,
+                                uncheckedThumbColor = DtnColors.TextHint,
+                                uncheckedTrackColor = DtnColors.CardBorder
+                            ),
+                            modifier = Modifier.scale(0.7f).height(20.dp)
+                        )
+                    }
+                }
+
+                // Share Link Shortcut
+                OutlinedButton(
+                    onClick = {
+                        val inviteLink = orchestrator.buildMyInviteLink()
+                        copyToClipboard(inviteLink)
+                        linkCopiedNotification = true
+                    },
                     shape = DtnShapes.Button,
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                     modifier = Modifier.height(36.dp)
                 ) {
-                    Icon(Icons.Filled.Podcasts, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Announce", style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold))
+                    Icon(
+                        if (linkCopiedNotification) Icons.Filled.Check else Icons.Filled.Link,
+                        contentDescription = null,
+                        modifier = Modifier.size(15.dp),
+                        tint = if (linkCopiedNotification) DtnColors.GreenText else DtnColors.Primary
+                    )
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        if (linkCopiedNotification) "Link Copied!" else "Share Link",
+                        style = TextStyle(
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (linkCopiedNotification) DtnColors.GreenText else DtnColors.Primary
+                        )
+                    )
                 }
             }
         }
@@ -472,44 +544,55 @@ fun LeftSidebar(
     var searchQuery by remember { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
-        // Navigation Tabs (5 tabs Segmented bar)
+        // Navigation Tabs (2-row grid for 6 tabs)
         Surface(
-            shape = DtnShapes.Button,
+            shape = RoundedCornerShape(10.dp),
             color = DtnColors.Track,
-            modifier = Modifier.fillMaxWidth().height(42.dp)
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Row(modifier = Modifier.fillMaxSize().padding(2.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-                DesktopNavTab.entries.forEach { tab ->
-                    val isSelected = activeTab == tab
-                    Surface(
-                        modifier = Modifier.weight(1f).fillMaxHeight().clickable { onTabSelected(tab) },
-                        shape = RoundedCornerShape(8.dp),
-                        color = if (isSelected) DtnColors.Card else Color.Transparent
+            Column(modifier = Modifier.padding(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                val row1 = listOf(DesktopNavTab.CHATS, DesktopNavTab.QUEUE, DesktopNavTab.NETWORK)
+                val row2 = listOf(DesktopNavTab.SIMULATION, DesktopNavTab.JOURNAL, DesktopNavTab.CONSOLE)
+                listOf(row1, row2).forEach { tabRow ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().height(34.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                                    Icon(
-                                        imageVector = tab.icon,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(14.dp),
-                                        tint = if (isSelected) DtnColors.Primary else DtnColors.TextSubtitle
-                                    )
-                                    Text(
-                                        text = tab.label,
-                                        style = TextStyle(
-                                            fontSize = 11.sp,
-                                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
-                                            color = if (isSelected) DtnColors.Primary else DtnColors.TextSubtitle
+                        tabRow.forEach { tab ->
+                            val isSelected = activeTab == tab
+                            Surface(
+                                modifier = Modifier.weight(1f).fillMaxHeight().clickable { onTabSelected(tab) },
+                                shape = RoundedCornerShape(7.dp),
+                                color = if (isSelected) DtnColors.Card else Color.Transparent
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        modifier = Modifier.padding(horizontal = 4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = tab.icon,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(13.dp),
+                                            tint = if (isSelected) DtnColors.Primary else DtnColors.TextSubtitle
                                         )
-                                    )
-                                    if (tab == DesktopNavTab.QUEUE && bufferedCount > 0) {
-                                        Surface(shape = CircleShape, color = DtnColors.Orange) {
-                                            Text(
-                                                text = "$bufferedCount",
-                                                modifier = Modifier.padding(horizontal = 4.dp),
-                                                style = TextStyle(fontSize = 9.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                                        Text(
+                                            text = tab.label,
+                                            style = TextStyle(
+                                                fontSize = 11.sp,
+                                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                                color = if (isSelected) DtnColors.Primary else DtnColors.TextSubtitle
                                             )
+                                        )
+                                        if (tab == DesktopNavTab.QUEUE && bufferedCount > 0) {
+                                            Surface(shape = CircleShape, color = DtnColors.Orange) {
+                                                Text(
+                                                    text = "$bufferedCount",
+                                                    modifier = Modifier.padding(horizontal = 4.dp),
+                                                    style = TextStyle(fontSize = 9.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -686,8 +769,12 @@ fun ChatView(
     onlinePeers: Map<String, Any>,
     onSendMessage: (String) -> Unit,
     onMessageClick: (ChatMessage) -> Unit,
+    onClearChat: (() -> Unit)? = null,
+    onPingPeer: (() -> Unit)? = null,
 ) {
-    var textInput by remember { mutableStateOf("") }
+    var textInput by remember(convKey) { mutableStateOf("") }
+    var showClearConfirm by remember(convKey) { mutableStateOf(false) }
+    var pingSentNotification by remember(convKey) { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
     val peerContact = contacts.firstOrNull { it.nodeId == convKey }
@@ -695,7 +782,13 @@ fun ChatView(
     val isOnline = onlinePeers.containsKey(convKey)
 
     val title = if (isBroadcast) "Global Broadcast" else (peerContact?.announceName?.takeIf { it.isNotBlank() } ?: convKey)
-    val subtitle = if (isBroadcast) "Store-and-forward mesh flood over all radios & relays" else if (isOnline) "● Online nearby via physical link" else "Last seen recently"
+    val subtitle = if (isBroadcast) {
+        "Store-and-forward mesh flood over all radios & relays"
+    } else if (isOnline) {
+        "● Online nearby via physical link"
+    } else {
+        "Last seen recently • Store-and-forward routing"
+    }
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
@@ -715,6 +808,7 @@ fun ChatView(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
+                // Left: Peer Avatar and Info
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Box(contentAlignment = Alignment.BottomEnd) {
                         Surface(
@@ -741,29 +835,76 @@ fun ChatView(
                     }
                 }
 
-                if (!isBroadcast && peerContact != null) {
-                    Surface(
-                        shape = DtnShapes.Pill,
-                        color = if (peerContact.keyVerified) DtnColors.GreenSoft else DtnColors.OrangeSoft
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                // Right: Actions (Encryption Tag, Ping Peer, Clear Chat)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (!isBroadcast && peerContact != null) {
+                        Surface(
+                            shape = DtnShapes.Pill,
+                            color = if (peerContact.keyVerified) DtnColors.GreenSoft else DtnColors.OrangeSoft
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    if (peerContact.keyVerified) Icons.Filled.VerifiedUser else Icons.Filled.Shield,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(13.dp),
+                                    tint = if (peerContact.keyVerified) DtnColors.GreenText else DtnColors.OrangeText
+                                )
+                                Text(
+                                    text = if (peerContact.keyVerified) "X25519 E2EE" else "Unverified Key",
+                                    style = TextStyle(
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (peerContact.keyVerified) DtnColors.GreenText else DtnColors.OrangeText
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                    // Ping Peer Action Button
+                    if (onPingPeer != null) {
+                        OutlinedButton(
+                            onClick = {
+                                onPingPeer()
+                                pingSentNotification = true
+                            },
+                            shape = DtnShapes.Button,
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 5.dp),
+                            modifier = Modifier.height(32.dp)
                         ) {
                             Icon(
-                                if (peerContact.keyVerified) Icons.Filled.VerifiedUser else Icons.Filled.Shield,
-                                contentDescription = null,
-                                modifier = Modifier.size(13.dp),
-                                tint = if (peerContact.keyVerified) DtnColors.GreenText else DtnColors.OrangeText
+                                if (pingSentNotification) Icons.Filled.Check else Icons.Filled.Bolt,
+                                contentDescription = "Ping Peer",
+                                modifier = Modifier.size(14.dp),
+                                tint = if (pingSentNotification) DtnColors.GreenText else DtnColors.Primary
                             )
+                            Spacer(Modifier.width(4.dp))
                             Text(
-                                text = if (peerContact.keyVerified) "X25519 E2EE" else "Unverified Key",
+                                if (pingSentNotification) "Ping Sent" else "Ping",
                                 style = TextStyle(
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.SemiBold,
-                                    color = if (peerContact.keyVerified) DtnColors.GreenText else DtnColors.OrangeText
+                                    color = if (pingSentNotification) DtnColors.GreenText else DtnColors.Primary
                                 )
+                            )
+                        }
+                    }
+
+                    // Clear Chat Button
+                    if (onClearChat != null && messages.isNotEmpty()) {
+                        IconButton(
+                            onClick = { showClearConfirm = true },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Filled.DeleteSweep,
+                                contentDescription = "Clear Chat",
+                                tint = DtnColors.TextSubtitle,
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
@@ -822,50 +963,164 @@ fun ChatView(
 
         HorizontalDivider(thickness = 1.dp, color = DtnColors.CardBorder)
 
-        // Bottom Message Composer
+        // Modern Bottom Message Composer & Quick Helpers
         Surface(
             color = DtnColors.Card,
-            modifier = Modifier.fillMaxWidth().height(72.dp)
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = 8.dp), verticalArrangement = Arrangement.Center) {
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                // Row of Quick Emojis & Quick Preset Action Chips
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    // Quick Emojis
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        val quickEmojis = listOf("👋", "👍", "❤️", "📍", "📡", "🤝", "✅", "⚠️")
+                        quickEmojis.forEach { emoji ->
+                            Surface(
+                                shape = CircleShape,
+                                color = DtnColors.Track,
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .clickable { textInput += emoji }
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(emoji, style = TextStyle(fontSize = 13.sp))
+                                }
+                            }
+                        }
+                    }
+
+                    // Quick Preset Chips
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        val quickPresets = listOf("👋 Hello!", "📡 Ping Mesh", "📍 Location Check", "✓ Received")
+                        quickPresets.forEach { preset ->
+                            Surface(
+                                shape = DtnShapes.Pill,
+                                color = DtnColors.Track,
+                                border = BorderStroke(1.dp, DtnColors.CardBorder),
+                                modifier = Modifier
+                                    .height(24.dp)
+                                    .clip(DtnShapes.Pill)
+                                    .clickable {
+                                        onSendMessage(preset)
+                                    }
+                            ) {
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier.padding(horizontal = 8.dp)
+                                ) {
+                                    Text(
+                                        text = preset,
+                                        style = TextStyle(fontSize = 11.sp, color = DtnColors.TextSubtitle, fontWeight = FontWeight.Medium)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Main Input Row: Dynamic TextField + Byte Counter + Send Button
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Bottom,
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Surface(
-                        shape = RoundedCornerShape(24.dp),
+                        shape = RoundedCornerShape(20.dp),
                         color = Color.White,
                         border = BorderStroke(1.dp, DtnColors.CardBorder),
-                        modifier = Modifier.weight(1f).height(48.dp)
+                        modifier = Modifier.weight(1f).defaultMinSize(minHeight = 44.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            TextField(
-                                value = textInput,
-                                onValueChange = { textInput = it },
-                                textStyle = TextStyle(fontSize = 14.sp, color = DtnColors.TextTitle),
-                                placeholder = { Text("Message $title...", style = TextStyle(fontSize = 13.sp, color = DtnColors.TextHint)) },
-                                colors = TextFieldDefaults.colors(
-                                    focusedContainerColor = Color.Transparent,
-                                    unfocusedContainerColor = Color.Transparent,
-                                    focusedIndicatorColor = Color.Transparent,
-                                    unfocusedIndicatorColor = Color.Transparent
-                                ),
-                                modifier = Modifier.fillMaxWidth().onKeyEvent { keyEvent ->
-                                    if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Enter) {
-                                        if (!keyEvent.isShiftPressed) {
-                                            if (textInput.isNotBlank()) {
-                                                onSendMessage(textInput.trim())
-                                                textInput = ""
+                        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                TextField(
+                                    value = textInput,
+                                    onValueChange = { textInput = it },
+                                    textStyle = TextStyle(fontSize = 14.sp, color = DtnColors.TextTitle, lineHeight = 20.sp),
+                                    placeholder = {
+                                        Text("Message $title (Enter to send, Shift+Enter for new line)...", style = TextStyle(fontSize = 13.sp, color = DtnColors.TextHint))
+                                    },
+                                    singleLine = false,
+                                    maxLines = 4,
+                                    colors = TextFieldDefaults.colors(
+                                        focusedContainerColor = Color.Transparent,
+                                        unfocusedContainerColor = Color.Transparent,
+                                        focusedIndicatorColor = Color.Transparent,
+                                        unfocusedIndicatorColor = Color.Transparent
+                                    ),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .onPreviewKeyEvent { keyEvent ->
+                                            if (keyEvent.type == KeyEventType.KeyDown && (keyEvent.key == Key.Enter || keyEvent.key == Key.NumPadEnter)) {
+                                                if (keyEvent.isShiftPressed) {
+                                                    false // Allow Shift+Enter to insert newline
+                                                } else {
+                                                    // Enter alone sends message and consumes event
+                                                    if (textInput.isNotBlank()) {
+                                                        onSendMessage(textInput.trim())
+                                                        textInput = ""
+                                                    }
+                                                    true
+                                                }
+                                            } else {
+                                                false
                                             }
-                                            true
-                                        } else false
-                                    } else false
+                                        }
+                                )
+
+                                if (textInput.isNotBlank()) {
+                                    IconButton(
+                                        onClick = { textInput = "" },
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(Icons.Filled.Close, contentDescription = "Clear", tint = DtnColors.TextHint, modifier = Modifier.size(16.dp))
+                                    }
                                 }
-                            )
+                            }
+
+                            // Sub-row: Byte budget and keyboard shortcut hints
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 2.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                val byteCount = textInput.toByteArray(Charsets.UTF_8).size
+                                val budgetMax = 223
+                                Text(
+                                    text = "Enter ↵ to send • Shift+Enter ↵ for new line",
+                                    style = TextStyle(fontSize = 10.sp, color = DtnColors.TextHint)
+                                )
+
+                                Text(
+                                    text = "$byteCount/$budgetMax B",
+                                    style = TextStyle(
+                                        fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = when {
+                                            byteCount > budgetMax -> DtnColors.Orange
+                                            byteCount > 180 -> DtnColors.OrangeText
+                                            else -> DtnColors.TextHint
+                                        }
+                                    )
+                                )
+                            }
                         }
                     }
 
@@ -877,14 +1132,41 @@ fun ChatView(
                             }
                         },
                         shape = CircleShape,
-                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = DtnColors.Primary),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = if (textInput.isNotBlank()) DtnColors.Primary else DtnColors.Track,
+                            contentColor = if (textInput.isNotBlank()) Color.White else DtnColors.TextHint
+                        ),
                         modifier = Modifier.size(44.dp)
                     ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = Color.White, modifier = Modifier.size(19.dp))
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(19.dp))
                     }
                 }
             }
         }
+    }
+
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("Clear Chat History?", style = DtnType.RowTitle) },
+            text = { Text("Are you sure you want to delete all messages in this conversation from the local database?", style = DtnType.RowSubtitle) },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onClearChat?.invoke()
+                        showClearConfirm = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = DtnColors.Red)
+                ) {
+                    Text("Delete", color = Color.White)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showClearConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 

@@ -119,5 +119,12 @@ tasks.matching { it.name == "createDistributable" }.configureEach {
                 into(destDir)
             }
         }
+        val simDir = file("tools/sim-dimaxprop")
+        if (simDir.exists() && destDir.exists()) {
+            copy {
+                from(simDir)
+                into(file("$destDir/tools/sim-dimaxprop"))
+            }
+        }
     }
 }
