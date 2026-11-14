@@ -61,6 +61,27 @@ compose.desktop {
             description = "DTN Mesh Relay Desktop Command Station"
             copyright = "© 2026 DTN Mesh Team"
             vendor = "DTN Mesh"
+
+            modules(
+                "java.base",
+                "java.desktop",
+                "java.instrument",
+                "java.logging",
+                "java.management",
+                "java.naming",
+                "java.net.http",
+                "java.prefs",
+                "java.rmi",
+                "java.scripting",
+                "java.security.jgss",
+                "java.security.sasl",
+                "java.sql",
+                "java.xml",
+                "jdk.crypto.cryptoki",
+                "jdk.crypto.ec",
+                "jdk.unsupported"
+            )
+
             windows {
                 menu = true
                 shortcut = true

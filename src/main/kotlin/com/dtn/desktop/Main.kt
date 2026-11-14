@@ -40,24 +40,41 @@ import java.util.*
 
 enum class DesktopNavTab { CHATS, QUEUE, TOPOLOGY, CONSOLE }
 
-fun main() = application {
-    val storageDir = remember { File(System.getProperty("user.home"), ".dtnmesh").apply { mkdirs() } }
-    val vault = remember { KeyVault(storageDir) }
-    val identity = remember { DtnIdentity(storageDir, vault) }
-    val database = remember { DesktopDatabase(storageDir) }
-    val lifecycleLog = remember { MessageLifecycleLog(storageDir) }
-    val orchestrator = remember { DesktopOrchestrator(identity, database, lifecycleLog) }
-
-    LaunchedEffect(Unit) {
-        orchestrator.start()
+fun main() {
+    Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+        System.err.println("FATAL: Uncaught exception on thread ${thread.name}:")
+        throwable.printStackTrace()
+        try {
+            val logFile = File(File(System.getProperty("user.home"), ".dtnmesh"), "crash.log")
+            logFile.parentFile?.mkdirs()
+            logFile.writeText("CRASH at ${Date()} on thread [${thread.name}]:\n" + throwable.stackTraceToString())
+            javax.swing.JOptionPane.showMessageDialog(
+                null,
+                "DTN Desktop encountered an unhandled error:\n\n${throwable.javaClass.simpleName}: ${throwable.message}\n\nCrash log saved to:\n${logFile.absolutePath}",
+                "DTN Desktop — Error",
+                javax.swing.JOptionPane.ERROR_MESSAGE
+            )
+        } catch (_: Exception) {}
     }
 
-    val windowState = rememberWindowState(
-        position = WindowPosition(Alignment.Center),
-        size = DpSize(1200.dp, 800.dp)
-    )
+    application {
+        val storageDir = remember { File(System.getProperty("user.home"), ".dtnmesh").apply { mkdirs() } }
+        val vault = remember { KeyVault(storageDir) }
+        val identity = remember { DtnIdentity(storageDir, vault) }
+        val database = remember { DesktopDatabase(storageDir) }
+        val lifecycleLog = remember { MessageLifecycleLog(storageDir) }
+        val orchestrator = remember { DesktopOrchestrator(identity, database, lifecycleLog) }
 
-    Window(
+        LaunchedEffect(Unit) {
+            orchestrator.start()
+        }
+
+        val windowState = rememberWindowState(
+            position = WindowPosition(Alignment.Center),
+            size = DpSize(1200.dp, 800.dp)
+        )
+
+        Window(
         onCloseRequest = {
             orchestrator.stop()
             exitApplication()
@@ -81,6 +98,7 @@ fun main() = application {
             }
         }
     }
+}
 }
 
 @Composable
