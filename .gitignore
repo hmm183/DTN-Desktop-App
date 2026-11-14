@@ -7,3 +7,5 @@ out/
 local.properties
 keystore.properties
 *.log
+tools/**/bin/
+tools/**/obj/

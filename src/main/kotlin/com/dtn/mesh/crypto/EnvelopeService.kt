@@ -43,6 +43,27 @@ object EnvelopeService {
     }
 
     fun openBytes(
+        msg: DtnMessage,
+        recipientPriv: ByteArray,
+        senderPub: ByteArray,
+    ): ByteArray? {
+        val suite = msg.flags and 0x07
+        val mid = uuid16(msg.id)
+        val originNum = msg.originNodeId.toNodeNum32()
+        val destNum = msg.destinationNodeId.toNodeNum32()
+        val aad = DtnWireCodec.aadHeader(msg)
+
+        return when (suite) {
+            DtnCrypto.SUITE_PLAIN -> msg.payloadBytes
+            DtnCrypto.SUITE_DM -> {
+                val root = DtnCrypto.x25519(recipientPriv, senderPub)
+                DtnCrypto.open(root, mid, originNum, destNum, DtnCrypto.SUITE_DM, msg.fragmentIndex, aad, msg.payloadBytes)
+            }
+            else -> msg.payloadBytes
+        }
+    }
+
+    fun openBytes(
         sealed: ByteArray,
         messageId: String,
         originNodeId: NodeId,

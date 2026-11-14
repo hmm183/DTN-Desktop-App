@@ -90,3 +90,34 @@ compose.desktop {
         }
     }
 }
+
+val buildBleWorker by tasks.registering(Exec::class) {
+    workingDir = file("tools/ble-worker")
+    commandLine("dotnet", "publish", "-c", "Release", "-r", "win-x64", "--self-contained", "false")
+}
+
+tasks.named("processResources") {
+    dependsOn(buildBleWorker)
+    doLast {
+        val srcExe = file("tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/win-x64/publish/dtn-ble-worker.exe")
+        if (srcExe.exists()) {
+            copy {
+                from(srcExe)
+                into(file("${layout.buildDirectory.get()}/resources/main"))
+            }
+        }
+    }
+}
+
+tasks.matching { it.name == "createDistributable" }.configureEach {
+    doLast {
+        val srcExe = file("tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/win-x64/publish/dtn-ble-worker.exe")
+        val destDir = file("${layout.buildDirectory.get()}/compose/binaries/main/app/DTNDesktop")
+        if (srcExe.exists() && destDir.exists()) {
+            copy {
+                from(srcExe)
+                into(destDir)
+            }
+        }
+    }
+}

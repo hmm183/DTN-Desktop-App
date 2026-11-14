@@ -44,9 +44,17 @@ class DesktopOrchestrator(
     private val _activeStrategy = MutableStateFlow(StrategyType.EPIDEMIC)
     val activeStrategy: StateFlow<StrategyType> = _activeStrategy.asStateFlow()
 
+    private val lastAnnounceSentTo = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
     fun start() {
         transportManager.onRelayConnected = {
             broadcastAnnounce()
+        }
+        transportManager.onPeerDiscovered = { peerId ->
+            // Proactively announce to newly discovered peer
+            scope.launch {
+                sendAnnounceTo(NodeId(peerId))
+            }
         }
         transportManager.startAll()
         scope.launch {
@@ -75,18 +83,20 @@ class DesktopOrchestrator(
         val now = System.currentTimeMillis()
 
         // 1. Encrypt text payload
+        val plainBytes = text.toByteArray(Charsets.UTF_8)
         val payloadBytes: ByteArray
         val flags: Int
 
         if (destination == NodeId.BROADCAST) {
-            payloadBytes = text.toByteArray(Charsets.UTF_8)
-            flags = 0 // Plaintext
+            payloadBytes = plainBytes
+            flags = (DtnCrypto.SUITE_PLAIN and 0x07) or (1 shl 6)
         } else {
             // Lookup recipient contact X25519 public key
             val contact = database.contacts.value.firstOrNull { it.nodeId == destination.value }
+            val dmPlain = com.dtn.mesh.routing.AlgorithmCode.prefix(strategySelector.activeType, plainBytes)
             if (contact?.xPub != null) {
                 payloadBytes = EnvelopeService.sealBytes(
-                    plaintext = text.toByteArray(Charsets.UTF_8),
+                    plaintext = dmPlain,
                     messageId = msgId,
                     originNodeId = identity.nodeId,
                     destinationNodeId = destination,
@@ -97,11 +107,12 @@ class DesktopOrchestrator(
                     senderPriv = identity.xPriv,
                     recipientPub = contact.xPub,
                 )
-                flags = DtnCrypto.SUITE_DM
+                flags = (DtnCrypto.SUITE_DM and 0x07) or (1 shl 6)
             } else {
-                // If keys not yet pinned, transmit plaintext with prompt
-                payloadBytes = text.toByteArray(Charsets.UTF_8)
-                flags = 0
+                // If keys not yet pinned, transmit plaintext with prompt and request announce
+                payloadBytes = dmPlain
+                flags = (DtnCrypto.SUITE_PLAIN and 0x07) or (1 shl 6)
+                sendAnnounceTo(destination, wantsReply = true)
             }
         }
 
@@ -183,15 +194,35 @@ class DesktopOrchestrator(
                     keyFirstSeenMs = System.currentTimeMillis()
                 )
             )
+            // Mutual Announce: If peer requested a reply, or is direct, or we haven't announced to peer recently
+            val wantsReply = (payload.flags and Announce.FLAG_WANTS_REPLY) != 0
+            val isDirect = bundle.destinationNodeId == identity.nodeId
+            val peerStr = bundle.originNodeId.value
+            val lastSent = lastAnnounceSentTo[peerStr] ?: 0L
+            val now = System.currentTimeMillis()
+            if (wantsReply || isDirect || (now - lastSent > 60_000L)) {
+                sendAnnounceTo(bundle.originNodeId)
+            }
         }
     }
 
     private fun handleAck(bundle: DtnMessage) {
-        // Receipt received!
-        val targetMsgId = String(bundle.payloadBytes, Charsets.UTF_8).trim()
-        database.updateChatStatus(targetMsgId, "DELIVERED")
-        database.removeBufferedMessage(targetMsgId)
-        lifecycleLog.logEvent(LifecycleEvent.DELIVERED, targetMsgId, bundle.originNodeId.value, identity.nodeId.value, "Receipt ✓✓")
+        val payload = bundle.payloadBytes
+        if (payload.size >= 16) {
+            val count = payload.size / 16
+            for (i in 0 until count) {
+                val bb = java.nio.ByteBuffer.wrap(payload, i * 16, 16)
+                val targetMsgId = UUID(bb.long, bb.long).toString()
+                database.updateChatStatus(targetMsgId, "DELIVERED")
+                database.removeBufferedMessage(targetMsgId)
+                lifecycleLog.logEvent(LifecycleEvent.DELIVERED, targetMsgId, bundle.originNodeId.value, identity.nodeId.value, "Receipt ✓✓")
+            }
+        } else {
+            val targetMsgId = String(payload, Charsets.UTF_8).trim()
+            database.updateChatStatus(targetMsgId, "DELIVERED")
+            database.removeBufferedMessage(targetMsgId)
+            lifecycleLog.logEvent(LifecycleEvent.DELIVERED, targetMsgId, bundle.originNodeId.value, identity.nodeId.value, "Receipt ✓✓")
+        }
     }
 
     private fun handleDataBundle(bundle: DtnMessage, via: String) {
@@ -214,28 +245,33 @@ class DesktopOrchestrator(
             }
 
             // Decrypt payload
+            val suite = bundle.flags and 0x07
             val text: String
 
-            if (bundle.flags == DtnCrypto.SUITE_DM && contact?.xPub != null) {
-                text = try {
-                    val raw = EnvelopeService.openBytes(
-                        sealed = bundle.payloadBytes,
-                        messageId = bundle.id,
-                        originNodeId = bundle.originNodeId,
-                        destinationNodeId = bundle.destinationNodeId,
-                        channel = 0,
-                        fragIndex = 0,
-                        fragTotal = 1,
-                        suite = DtnCrypto.SUITE_DM,
-                        recipientPriv = identity.xPriv,
-                        senderPub = contact.xPub,
-                    )
-                    raw?.let { String(it, Charsets.UTF_8) } ?: "[Encrypted message - could not decrypt]"
-                } catch (e: Exception) {
-                    "[Encrypted message - could not decrypt]"
+            if (suite == DtnCrypto.SUITE_DM) {
+                if (contact?.xPub != null) {
+                    text = try {
+                        val raw = EnvelopeService.openBytes(
+                            msg = bundle,
+                            recipientPriv = identity.xPriv,
+                            senderPub = contact.xPub,
+                        )
+                        if (raw != null) {
+                            val (algo, cleanBytes) = com.dtn.mesh.routing.AlgorithmCode.split(raw)
+                            String(cleanBytes, Charsets.UTF_8)
+                        } else {
+                            "[Encrypted DM - could not decrypt]"
+                        }
+                    } catch (e: Exception) {
+                        "[Encrypted DM - could not decrypt: ${e.message}]"
+                    }
+                } else {
+                    text = "[Encrypted DM - waiting for peer public key]"
+                    sendAnnounceTo(bundle.originNodeId, wantsReply = true)
                 }
             } else {
-                text = String(bundle.payloadBytes, Charsets.UTF_8)
+                val (algo, cleanBytes) = com.dtn.mesh.routing.AlgorithmCode.split(bundle.payloadBytes)
+                text = String(cleanBytes, Charsets.UTF_8)
             }
 
             // Save to chat history
@@ -266,16 +302,50 @@ class DesktopOrchestrator(
     }
 
     private fun sendReceipt(origin: NodeId, originalMsgId: String) {
+        val u = try {
+            UUID.fromString(originalMsgId)
+        } catch (_: Exception) {
+            UUID.nameUUIDFromBytes(originalMsgId.toByteArray(Charsets.UTF_8))
+        }
+        val bb = java.nio.ByteBuffer.allocate(16)
+        bb.putLong(u.mostSignificantBits)
+        bb.putLong(u.leastSignificantBits)
         val ackBundle = DtnMessage(
             id = UUID.randomUUID().toString(),
             originNodeId = identity.nodeId,
             destinationNodeId = origin,
-            payloadBytes = originalMsgId.toByteArray(Charsets.UTF_8),
+            payloadBytes = bb.array(),
             createdAtMs = System.currentTimeMillis(),
-            ttlMs = 3600_000L,
+            ttlMs = 300_000L,
             messageType = DtnMessageType.ROUTING_ACK
         )
         transportManager.transmitBundle(ackBundle)
+    }
+
+    fun sendAnnounceTo(destination: NodeId, wantsReply: Boolean = false) {
+        val now = System.currentTimeMillis()
+        lastAnnounceSentTo[destination.value] = now
+        val computerName = System.getenv("COMPUTERNAME") ?: "Desktop Station"
+        val payload = Announce.build(
+            nodeNum = identity.nodeNum32,
+            xPub = identity.xPub,
+            edPub = identity.edPub,
+            edSeed = identity.edSeed,
+            name = computerName,
+            issuedAtSec = (now / 1000).toInt(),
+            flags = if (wantsReply) Announce.FLAG_WANTS_REPLY else 0,
+        )
+        val bundle = DtnMessage(
+            id = UUID.randomUUID().toString(),
+            originNodeId = identity.nodeId,
+            destinationNodeId = destination,
+            payloadBytes = payload,
+            createdAtMs = now,
+            ttlMs = 1800_000L,
+            messageType = DtnMessageType.ANNOUNCE
+        )
+        transportManager.transmitBundle(bundle)
+        lifecycleLog.logConsole("Orchestrator", "Sent direct ANNOUNCE to ${destination.value.takeLast(8)}")
     }
 
     fun flushQueueNow() {

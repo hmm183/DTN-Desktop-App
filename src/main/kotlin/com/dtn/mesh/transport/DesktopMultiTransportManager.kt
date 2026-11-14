@@ -43,6 +43,7 @@ class DesktopMultiTransportManager(
     )
 
     var onRelayConnected: (() -> Unit)? = null
+    var onPeerDiscovered: ((String) -> Unit)? = null
 
     val internet = DesktopInternetTransportAdapter(
         localNodeId = localNodeId,
@@ -74,8 +75,12 @@ class DesktopMultiTransportManager(
 
     private fun updatePeer(nodeId: String, online: Boolean, linkType: String) {
         val current = _onlinePeers.value.toMutableMap()
+        val isNew = !current.containsKey(nodeId)
         if (online) {
             current[nodeId] = PeerEndpoint(nodeId, true, linkType, System.currentTimeMillis())
+            if (isNew) {
+                onPeerDiscovered?.invoke(nodeId)
+            }
         } else {
             current.remove(nodeId)
         }

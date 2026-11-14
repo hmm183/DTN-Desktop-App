@@ -267,7 +267,10 @@ class DesktopDatabase(
                     last_encounter_ms = excluded.last_encounter_ms,
                     announce_name = coalesce(excluded.announce_name, contacts.announce_name),
                     x_pub = coalesce(excluded.x_pub, contacts.x_pub),
-                    ed_pub = coalesce(excluded.ed_pub, contacts.ed_pub)
+                    ed_pub = coalesce(excluded.ed_pub, contacts.ed_pub),
+                    key_verified = case when excluded.key_verified = 1 then 1 else contacts.key_verified end,
+                    key_first_seen_ms = coalesce(contacts.key_first_seen_ms, excluded.key_first_seen_ms),
+                    is_added = max(contacts.is_added, excluded.is_added)
             """.trimIndent())
             ps.setString(1, c.nodeId)
             ps.setDouble(2, c.deliveryProbability)

@@ -144,4 +144,62 @@ class DtnCryptoTest {
         assertEquals(187, payload.size)
         assertTrue(payload.size <= 223)
     }
+
+    @Test
+    fun envelopeService_wireFlags65_openBytesSucceeds() {
+        val (senderPriv, senderPub) = DtnCrypto.generateX25519()
+        val (recvPriv, recvPub) = DtnCrypto.generateX25519()
+        val origin = com.dtn.mesh.model.NodeId("!11111111")
+        val dest = com.dtn.mesh.model.NodeId("!22222222")
+        val msgId = java.util.UUID.randomUUID().toString()
+        val plainText = "Hello from Android test phone!"
+
+        val sealed = EnvelopeService.sealBytes(
+            plaintext = plainText.toByteArray(Charsets.UTF_8),
+            messageId = msgId,
+            originNodeId = origin,
+            destinationNodeId = dest,
+            channel = 0,
+            fragIndex = 0,
+            fragTotal = 1,
+            suite = DtnCrypto.SUITE_DM,
+            senderPriv = senderPriv,
+            recipientPub = recvPub
+        )
+
+        // Android wire bundle format
+        val flags = (DtnCrypto.SUITE_DM and 0x07) or (1 shl 6) // 65
+        val bundle = com.dtn.mesh.model.DtnMessage(
+            id = msgId,
+            originNodeId = origin,
+            destinationNodeId = dest,
+            payloadBytes = sealed,
+            createdAtMs = System.currentTimeMillis(),
+            ttlMs = 3600_000L,
+            flags = flags,
+            messageType = com.dtn.mesh.model.DtnMessageType.DATA
+        )
+
+        val decrypted = EnvelopeService.openBytes(
+            msg = bundle,
+            recipientPriv = recvPriv,
+            senderPub = senderPub
+        )
+
+        assertNotNull(decrypted)
+        assertEquals(plainText, String(decrypted!!, Charsets.UTF_8))
+    }
+
+    @Test
+    fun routingAck_16ByteBinaryUuidRoundTrip() {
+        val originalUuid = java.util.UUID.randomUUID()
+        val bb = java.nio.ByteBuffer.allocate(16)
+        bb.putLong(originalUuid.mostSignificantBits)
+        bb.putLong(originalUuid.leastSignificantBits)
+        val payload = bb.array()
+
+        val parsedBb = java.nio.ByteBuffer.wrap(payload)
+        val parsedUuid = java.util.UUID(parsedBb.long, parsedBb.long)
+        assertEquals(originalUuid, parsedUuid)
+    }
 }
