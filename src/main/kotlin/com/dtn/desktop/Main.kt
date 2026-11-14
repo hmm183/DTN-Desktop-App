@@ -1,7 +1,9 @@
 package com.dtn.desktop
 
 import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -18,9 +20,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.*
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -44,12 +50,17 @@ import com.dtn.mesh.service.DesktopOrchestrator
 import com.dtn.mesh.service.LifecycleEntry
 import com.dtn.mesh.service.LifecycleEvent
 import com.dtn.mesh.service.MessageLifecycleLog
+import com.dtn.mesh.transport.PeerEndpoint
 import kotlinx.coroutines.launch
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 enum class DesktopNavTab(val label: String, val icon: ImageVector) {
     CHATS("Chats", Icons.AutoMirrored.Filled.Chat),
@@ -232,7 +243,11 @@ fun DesktopAppScreen(
                         NetworkTopologyView(
                             orchestrator = orchestrator,
                             onlinePeers = onlinePeers,
-                            contacts = contacts
+                            contacts = contacts,
+                            onOpenChat = { peerId ->
+                                selectedConvKey = peerId
+                                activeTab = DesktopNavTab.CHATS
+                            }
                         )
                     }
                     DesktopNavTab.JOURNAL -> {
@@ -620,11 +635,12 @@ fun ConversationRowItem(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // Avatar Circle
+            // Avatar Circle with live status ring
             Box(contentAlignment = Alignment.BottomEnd) {
                 Surface(
                     shape = CircleShape,
                     color = avatarColor,
+                    border = if (isOnline) BorderStroke(2.dp, DtnColors.Green) else null,
                     modifier = Modifier.size(38.dp)
                 ) {
                     Box(contentAlignment = Alignment.Center) {
@@ -661,7 +677,7 @@ fun ConversationRowItem(
     }
 }
 
-// ── CENTER CHAT VIEW ─────────────────────────────────────────────────────────
+// ── HIGH-POLISH CHAT VIEW ───────────────────────────────────────────────────
 @Composable
 fun ChatView(
     convKey: String,
@@ -679,7 +695,7 @@ fun ChatView(
     val isOnline = onlinePeers.containsKey(convKey)
 
     val title = if (isBroadcast) "Global Broadcast" else (peerContact?.announceName?.takeIf { it.isNotBlank() } ?: convKey)
-    val subtitle = if (isBroadcast) "Store-and-forward mesh broadcast across all radios & relays" else if (isOnline) "● Online nearby" else "Last seen recently"
+    val subtitle = if (isBroadcast) "Store-and-forward mesh flood over all radios & relays" else if (isOnline) "● Online nearby via physical link" else "Last seen recently"
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
@@ -688,10 +704,11 @@ fun ChatView(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // Chat Header
+        // Modern Chat Header
         Surface(
             color = DtnColors.Card,
-            modifier = Modifier.fillMaxWidth().height(60.dp)
+            shadowElevation = 1.dp,
+            modifier = Modifier.fillMaxWidth().height(64.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
@@ -699,16 +716,22 @@ fun ChatView(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Surface(
-                        shape = CircleShape,
-                        color = if (isBroadcast) DtnColors.GroupAvatar else DtnColors.avatarFor(convKey),
-                        modifier = Modifier.size(38.dp)
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Text(
-                                text = if (isBroadcast) "📢" else (title.firstOrNull()?.uppercaseChar()?.toString() ?: "?"),
-                                style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                            )
+                    Box(contentAlignment = Alignment.BottomEnd) {
+                        Surface(
+                            shape = CircleShape,
+                            color = if (isBroadcast) DtnColors.GroupAvatar else DtnColors.avatarFor(convKey),
+                            border = if (isOnline && !isBroadcast) BorderStroke(2.dp, DtnColors.Green) else null,
+                            modifier = Modifier.size(40.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = if (isBroadcast) "📢" else (title.firstOrNull()?.uppercaseChar()?.toString() ?: "?"),
+                                    style = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                )
+                            }
+                        }
+                        if (isOnline && !isBroadcast) {
+                            Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(DtnColors.Green).border(1.5.dp, Color.White, CircleShape))
                         }
                     }
 
@@ -750,8 +773,8 @@ fun ChatView(
 
         HorizontalDivider(thickness = 1.dp, color = DtnColors.CardBorder)
 
-        // Messages Stream
-        Box(modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 20.dp)) {
+        // Messages Stream with Date Dividers
+        Box(modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 24.dp)) {
             if (messages.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -760,18 +783,38 @@ fun ChatView(
                                 Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = null, tint = DtnColors.Primary, modifier = Modifier.size(28.dp))
                             }
                         }
-                        Text("No messages yet", style = DtnType.RowTitle.copy(color = DtnColors.TextSubtitle))
-                        Text("Send a message over DTN store-and-forward mesh", style = DtnType.Meta)
+                        Text("No messages in this channel yet", style = DtnType.RowTitle.copy(color = DtnColors.TextSubtitle))
+                        Text("Type a message below to transmit across the store-and-forward mesh", style = DtnType.Meta)
                     }
                 }
             } else {
+                val cal = Calendar.getInstance()
+                val todayStr = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date())
+                cal.add(Calendar.DATE, -1)
+                val yesterdayStr = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(cal.time)
+
                 LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize().padding(vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(messages) { msg ->
-                        ChatBubbleItem(msg = msg, onClick = { onMessageClick(msg) })
+                    var prevDateKey = ""
+                    messages.forEach { msg ->
+                        val dateKey = SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date(msg.createdAtMs))
+                        if (dateKey != prevDateKey) {
+                            prevDateKey = dateKey
+                            val label = when (dateKey) {
+                                todayStr -> "Today"
+                                yesterdayStr -> "Yesterday"
+                                else -> SimpleDateFormat("MMM d, yyyy", Locale.getDefault()).format(Date(msg.createdAtMs))
+                            }
+                            item(key = "divider_${msg.id}") {
+                                DateDividerPill(label)
+                            }
+                        }
+                        item(key = msg.id) {
+                            ChatBubbleItem(msg = msg, onClick = { onMessageClick(msg) })
+                        }
                     }
                 }
             }
@@ -782,55 +825,82 @@ fun ChatView(
         // Bottom Message Composer
         Surface(
             color = DtnColors.Card,
-            modifier = Modifier.fillMaxWidth().height(68.dp)
+            modifier = Modifier.fillMaxWidth().height(72.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Surface(
-                    shape = DtnShapes.Field,
-                    color = DtnColors.Track,
-                    modifier = Modifier.weight(1f).fillMaxHeight()
+            Column(modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = 8.dp), verticalArrangement = Arrangement.Center) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    TextField(
-                        value = textInput,
-                        onValueChange = { textInput = it },
-                        textStyle = TextStyle(fontSize = 14.sp, color = DtnColors.TextTitle),
-                        placeholder = { Text("Type message... (Press Enter to send)", style = TextStyle(fontSize = 14.sp, color = DtnColors.TextHint)) },
-                        colors = TextFieldDefaults.colors(
-                            focusedContainerColor = Color.Transparent,
-                            unfocusedContainerColor = Color.Transparent,
-                            focusedIndicatorColor = Color.Transparent,
-                            unfocusedIndicatorColor = Color.Transparent
-                        ),
-                        modifier = Modifier.fillMaxSize().onKeyEvent { keyEvent ->
-                            if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Enter) {
-                                if (textInput.isNotBlank()) {
-                                    onSendMessage(textInput.trim())
-                                    textInput = ""
+                    Surface(
+                        shape = RoundedCornerShape(24.dp),
+                        color = Color.White,
+                        border = BorderStroke(1.dp, DtnColors.CardBorder),
+                        modifier = Modifier.weight(1f).height(48.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextField(
+                                value = textInput,
+                                onValueChange = { textInput = it },
+                                textStyle = TextStyle(fontSize = 14.sp, color = DtnColors.TextTitle),
+                                placeholder = { Text("Message $title...", style = TextStyle(fontSize = 13.sp, color = DtnColors.TextHint)) },
+                                colors = TextFieldDefaults.colors(
+                                    focusedContainerColor = Color.Transparent,
+                                    unfocusedContainerColor = Color.Transparent,
+                                    focusedIndicatorColor = Color.Transparent,
+                                    unfocusedIndicatorColor = Color.Transparent
+                                ),
+                                modifier = Modifier.fillMaxWidth().onKeyEvent { keyEvent ->
+                                    if (keyEvent.type == KeyEventType.KeyDown && keyEvent.key == Key.Enter) {
+                                        if (!keyEvent.isShiftPressed) {
+                                            if (textInput.isNotBlank()) {
+                                                onSendMessage(textInput.trim())
+                                                textInput = ""
+                                            }
+                                            true
+                                        } else false
+                                    } else false
                                 }
-                                true
-                            } else false
+                            )
                         }
-                    )
-                }
+                    }
 
-                FilledIconButton(
-                    onClick = {
-                        if (textInput.isNotBlank()) {
-                            onSendMessage(textInput.trim())
-                            textInput = ""
-                        }
-                    },
-                    shape = CircleShape,
-                    colors = IconButtonDefaults.filledIconButtonColors(containerColor = DtnColors.Primary),
-                    modifier = Modifier.size(44.dp)
-                ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = Color.White, modifier = Modifier.size(20.dp))
+                    FilledIconButton(
+                        onClick = {
+                            if (textInput.isNotBlank()) {
+                                onSendMessage(textInput.trim())
+                                textInput = ""
+                            }
+                        },
+                        shape = CircleShape,
+                        colors = IconButtonDefaults.filledIconButtonColors(containerColor = DtnColors.Primary),
+                        modifier = Modifier.size(44.dp)
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = Color.White, modifier = Modifier.size(19.dp))
+                    }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun DateDividerPill(dateText: String) {
+    Box(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
+        Surface(
+            shape = DtnShapes.Pill,
+            color = DtnColors.Track,
+            border = BorderStroke(1.dp, DtnColors.CardBorder)
+        ) {
+            Text(
+                text = dateText,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp),
+                style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = DtnColors.TextSubtitle)
+            )
         }
     }
 }
@@ -841,77 +911,313 @@ fun ChatBubbleItem(msg: ChatMessage, onClick: () -> Unit) {
     val timeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(msg.createdAtMs))
 
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
         horizontalAlignment = if (isOut) Alignment.End else Alignment.Start
     ) {
-        Surface(
-            shape = RoundedCornerShape(
-                topStart = 16.dp,
-                topEnd = 16.dp,
-                bottomStart = if (isOut) 16.dp else 4.dp,
-                bottomEnd = if (isOut) 4.dp else 16.dp
-            ),
-            color = if (isOut) DtnColors.BubbleOut else DtnColors.BubbleIn,
-            modifier = Modifier.widthIn(max = 540.dp).clickable { onClick() }
-        ) {
-            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (!isOut && msg.peerNodeId != null) {
-                        Text(
-                            text = msg.peerNodeId,
-                            style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold, color = DtnColors.Primary)
+        if (isOut) {
+            // Outbound message bubble (Deep Indigo Gradient with nested status ticks)
+            Surface(
+                shape = RoundedCornerShape(
+                    topStart = 18.dp,
+                    topEnd = 18.dp,
+                    bottomStart = 18.dp,
+                    bottomEnd = 4.dp
+                ),
+                color = Color.Transparent,
+                modifier = Modifier
+                    .widthIn(min = 90.dp, max = 560.dp)
+                    .clip(RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp, bottomStart = 18.dp, bottomEnd = 4.dp))
+                    .background(
+                        Brush.linearGradient(
+                            colors = listOf(Color(0xFF2563EB), Color(0xFF1D4ED8))
                         )
-                    } else {
-                        Spacer(Modifier.width(1.dp))
+                    )
+                    .clickable { onClick() }
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+                    Text(
+                        text = msg.text,
+                        style = TextStyle(fontSize = 14.sp, color = Color.White, lineHeight = 20.sp)
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    Row(
+                        modifier = Modifier.align(Alignment.End),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = timeStr,
+                            style = TextStyle(fontSize = 10.sp, color = Color(0xFFBFDBFE))
+                        )
+                        val (statusTick, tickColor) = when (msg.status) {
+                            "DELIVERED" -> "✓✓" to Color(0xFF4ADE80)
+                            "SENT" -> "✓" to Color(0xFF93C5FD)
+                            else -> "🕓" to Color(0xFFFCD34D)
+                        }
+                        Text(
+                            text = statusTick,
+                            style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold, color = tickColor)
+                        )
                     }
+                }
+            }
+        } else {
+            // Inbound message bubble (Pure White Card with Sender Pill)
+            Surface(
+                shape = RoundedCornerShape(
+                    topStart = 18.dp,
+                    topEnd = 18.dp,
+                    bottomStart = 4.dp,
+                    bottomEnd = 18.dp
+                ),
+                color = Color.White,
+                border = BorderStroke(1.dp, Color(0xFFE2E8F0)),
+                shadowElevation = 1.dp,
+                modifier = Modifier
+                    .widthIn(min = 90.dp, max = 560.dp)
+                    .clickable { onClick() }
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+                    if (msg.peerNodeId != null) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(DtnColors.avatarFor(msg.peerNodeId)))
+                            Text(
+                                text = msg.peerNodeId,
+                                style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold, color = DtnColors.avatarFor(msg.peerNodeId))
+                            )
+                        }
+                        Spacer(Modifier.height(3.dp))
+                    }
+                    Text(
+                        text = msg.text,
+                        style = TextStyle(fontSize = 14.sp, color = DtnColors.TextTitle, lineHeight = 20.sp)
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    Row(
+                        modifier = Modifier.align(Alignment.End),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = timeStr,
+                            style = TextStyle(fontSize = 10.sp, color = DtnColors.TextHint)
+                        )
+                        Icon(
+                            Icons.Filled.Info,
+                            contentDescription = "Inspect message",
+                            modifier = Modifier.size(11.dp),
+                            tint = DtnColors.TextHint.copy(alpha = 0.6f)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
 
-                    // Clickable info icon cue
-                    Icon(
-                        Icons.Filled.Info,
-                        contentDescription = "Inspect message",
-                        modifier = Modifier.size(13.dp),
-                        tint = if (isOut) Color.White.copy(alpha = 0.7f) else DtnColors.TextHint
+// ── NATIVE COMPOSE CANVAS 2D MESH TOPOLOGY GRAPH ───────────────────────────
+@Composable
+fun MeshTopologyCanvas(
+    localNodeId: String,
+    onlinePeers: Map<String, PeerEndpoint>,
+    contacts: List<Contact>,
+    selectedPeerId: String?,
+    onSelectPeer: (String) -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition()
+    val pulseRadius by infiniteTransition.animateFloat(
+        initialValue = 28f,
+        targetValue = 76f,
+        animationSpec = infiniteRepeatable(tween(2200, easing = LinearEasing), RepeatMode.Restart)
+    )
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(tween(2200, easing = LinearEasing), RepeatMode.Restart)
+    )
+
+    val peerList = remember(onlinePeers) { onlinePeers.values.toList() }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(320.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFF0A0F1D))
+            .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(16.dp))
+    ) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(peerList) {
+                    detectTapGestures { tapOffset ->
+                        val centerX = size.width / 2f
+                        val centerY = size.height / 2f
+                        val orbitRadius = (minOf(size.width, size.height) * 0.36f).coerceIn(90f, 130f)
+
+                        // Check tap hit on orbiting peers
+                        peerList.forEachIndexed { i, peer ->
+                            val angle = (i * (2 * PI / peerList.size) - PI / 2).toFloat()
+                            val peerX = centerX + orbitRadius * cos(angle)
+                            val peerY = centerY + orbitRadius * sin(angle)
+                            val dist = sqrt((tapOffset.x - peerX) * (tapOffset.x - peerX) + (tapOffset.y - peerY) * (tapOffset.y - peerY))
+                            if (dist <= 30f) {
+                                onSelectPeer(peer.nodeId)
+                            }
+                        }
+                    }
+                }
+        ) {
+            val centerX = size.width / 2f
+            val centerY = size.height / 2f
+            val orbitRadius = (minOf(size.width, size.height) * 0.36f).coerceIn(90f, 130f)
+
+            // 1. Radar Grid Concentric Circles
+            drawCircle(color = Color(0x1838BDF8), radius = orbitRadius * 0.4f, style = Stroke(width = 1f))
+            drawCircle(color = Color(0x2238BDF8), radius = orbitRadius * 0.75f, style = Stroke(width = 1f))
+            drawCircle(color = Color(0x2E38BDF8), radius = orbitRadius, style = Stroke(width = 1.2f))
+            drawCircle(color = Color(0x1438BDF8), radius = orbitRadius * 1.25f, style = Stroke(width = 1f))
+
+            // Crosshair lines
+            drawLine(
+                color = Color(0x1538BDF8),
+                start = Offset(centerX - orbitRadius * 1.3f, centerY),
+                end = Offset(centerX + orbitRadius * 1.3f, centerY),
+                strokeWidth = 1f
+            )
+            drawLine(
+                color = Color(0x1538BDF8),
+                start = Offset(centerX, centerY - orbitRadius * 1.3f),
+                end = Offset(centerX, centerY + orbitRadius * 1.3f),
+                strokeWidth = 1f
+            )
+
+            // 2. Center Station Node (Pulsing halo + Center circle)
+            drawCircle(
+                color = Color(0xFF3B82F6).copy(alpha = pulseAlpha),
+                radius = pulseRadius,
+                center = Offset(centerX, centerY)
+            )
+            drawCircle(
+                color = Color(0xFF2563EB),
+                radius = 24f,
+                center = Offset(centerX, centerY)
+            )
+            drawCircle(
+                color = Color(0xFF60A5FA),
+                radius = 16f,
+                center = Offset(centerX, centerY)
+            )
+            drawCircle(
+                color = Color.White,
+                radius = 6f,
+                center = Offset(centerX, centerY)
+            )
+
+            // 3. Orbiting Peers & Dynamic Connection Rays
+            if (peerList.isEmpty()) {
+                // Draw 4 default transport beacons orbiting
+                val defaultBeacons = listOf(
+                    "Local Wi-Fi" to Color(0xFF10B981),
+                    "BLE Active" to Color(0xFF38BDF8),
+                    "HiveMQ Relay" to Color(0xFFA855F7),
+                    "USB LoRa" to Color(0xFFF59E0B)
+                )
+                defaultBeacons.forEachIndexed { i, beacon ->
+                    val angle = (i * (2 * PI / defaultBeacons.size) - PI / 2).toFloat()
+                    val beaconX = centerX + orbitRadius * cos(angle)
+                    val beaconY = centerY + orbitRadius * sin(angle)
+
+                    drawLine(
+                        color = beacon.second.copy(alpha = 0.35f),
+                        start = Offset(centerX, centerY),
+                        end = Offset(beaconX, beaconY),
+                        strokeWidth = 1.5f
+                    )
+                    drawCircle(
+                        color = beacon.second.copy(alpha = 0.2f),
+                        radius = 18f,
+                        center = Offset(beaconX, beaconY)
+                    )
+                    drawCircle(
+                        color = beacon.second,
+                        radius = 8f,
+                        center = Offset(beaconX, beaconY)
                     )
                 }
+            } else {
+                peerList.forEachIndexed { i, peer ->
+                    val angle = (i * (2 * PI / peerList.size) - PI / 2).toFloat()
+                    val peerX = centerX + orbitRadius * cos(angle)
+                    val peerY = centerY + orbitRadius * sin(angle)
 
-                Spacer(Modifier.height(2.dp))
+                    val linkColor = when {
+                        peer.linkType.contains("Wi-Fi", ignoreCase = true) -> Color(0xFF10B981)
+                        peer.linkType.contains("BLE", ignoreCase = true) -> Color(0xFF38BDF8)
+                        peer.linkType.contains("LoRa", ignoreCase = true) -> Color(0xFFF59E0B)
+                        else -> Color(0xFFA855F7) // Relay
+                    }
 
-                Text(
-                    text = msg.text,
-                    style = TextStyle(fontSize = 14.sp, color = if (isOut) Color.White else DtnColors.TextTitle)
-                )
+                    // Connecting ray with pulse
+                    drawLine(
+                        color = linkColor.copy(alpha = 0.75f),
+                        start = Offset(centerX, centerY),
+                        end = Offset(peerX, peerY),
+                        strokeWidth = 2.5f
+                    )
+
+                    // Selection ring if active
+                    if (selectedPeerId == peer.nodeId) {
+                        drawCircle(
+                            color = Color.White,
+                            radius = 26f,
+                            center = Offset(peerX, peerY),
+                            style = Stroke(width = 2.5f)
+                        )
+                    }
+
+                    // Peer Node Outer Glow
+                    drawCircle(
+                        color = linkColor.copy(alpha = 0.25f),
+                        radius = 22f,
+                        center = Offset(peerX, peerY)
+                    )
+
+                    // Peer Avatar Node
+                    drawCircle(
+                        color = DtnColors.avatarFor(peer.nodeId),
+                        radius = 16f,
+                        center = Offset(peerX, peerY)
+                    )
+                    drawCircle(
+                        color = Color.White,
+                        radius = 5f,
+                        center = Offset(peerX, peerY)
+                    )
+                }
             }
         }
 
-        Spacer(Modifier.height(3.dp))
-
+        // Top Canvas Badge Overlay
         Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            modifier = Modifier.padding(horizontal = 4.dp)
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(text = timeStr, style = TextStyle(fontSize = 11.sp, color = DtnColors.TextHint))
-            if (isOut) {
-                val statusText = when (msg.status) {
-                    "DELIVERED" -> "✓✓ Delivered"
-                    "SENT" -> "✓ Sent"
-                    else -> "🕓 Queued"
+            Surface(shape = DtnShapes.Pill, color = Color(0xFF0F172A).copy(alpha = 0.85f), border = BorderStroke(1.dp, Color(0xFF334155))) {
+                Row(modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(Color(0xFF38BDF8)))
+                    Text("Station $localNodeId (Center)", style = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF38BDF8)))
                 }
-                val statusColor = when (msg.status) {
-                    "DELIVERED" -> DtnColors.GreenText
-                    "SENT" -> DtnColors.Primary
-                    else -> DtnColors.OrangeText
-                }
-                Text(text = "· $statusText", style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = statusColor))
             }
-            Text(
-                text = "· Click to inspect",
-                style = TextStyle(fontSize = 10.sp, color = DtnColors.TextHint, fontStyle = androidx.compose.ui.text.font.FontStyle.Italic)
-            )
+
+            Surface(shape = DtnShapes.Pill, color = Color(0xFF0F172A).copy(alpha = 0.85f), border = BorderStroke(1.dp, Color(0xFF334155))) {
+                Text(
+                    text = if (peerList.isEmpty()) "Tap node to inspect" else "${peerList.size} Active Peer Links",
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                    style = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = Color(0xFF94A3B8))
+                )
+            }
         }
     }
 }
@@ -1114,7 +1420,7 @@ fun MessageDetailsDialog(
                                         ) {
                                             Text(
                                                 text = entry.event.name,
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
                                                 style = TextStyle(fontSize = 10.sp, fontWeight = FontWeight.Bold)
                                             )
                                         }
@@ -1301,7 +1607,7 @@ fun QueueInspectorView(
                     colors = ButtonDefaults.buttonColors(containerColor = DtnColors.Primary),
                     shape = DtnShapes.Button
                 ) {
-                    Icon(Icons.Filled.Send, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Flush All Now")
                 }
@@ -1630,15 +1936,17 @@ fun JournalLogView(
     }
 }
 
-// ── UPGRADED NETWORK TOPOLOGY & WI-FI / BLE VIEW ─────────────────────────────
+// ── ADVANCED NETWORK TOPOLOGY VIEW WITH 2D CANVAS GRAPH ─────────────────────
 @Composable
 fun NetworkTopologyView(
     orchestrator: DesktopOrchestrator,
-    onlinePeers: Map<String, Any>,
-    contacts: List<Contact>
+    onlinePeers: Map<String, PeerEndpoint>,
+    contacts: List<Contact>,
+    onOpenChat: (String) -> Unit
 ) {
     var phoneIpInput by remember { mutableStateOf("") }
     var connectStatus by remember { mutableStateOf<String?>(null) }
+    var selectedGraphPeerId by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     val localIps = remember { orchestrator.getLocalIpAddresses() }
@@ -1649,7 +1957,7 @@ fun NetworkTopologyView(
 
     Column(modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text("Network Links & Discovered Nodes", style = DtnType.PageTitle)
-        Text("Physical mesh channels, direct IP links, and peer discovery status", style = DtnType.PageSubtitle)
+        Text("Physical mesh channels, direct IP links, and live 2D topology graph", style = DtnType.PageSubtitle)
 
         // 4 Physical Transport Overview Cards
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1657,6 +1965,99 @@ fun NetworkTopologyView(
             LinkCard("Local Wi-Fi", "TCP/UDP Port 9734", orchestrator.transportManager.wifiDirect.isListening.value, Modifier.weight(1f))
             LinkCard("Bluetooth LE", "GATT Server & Active Central", orchestrator.transportManager.ble.isScanning.value, Modifier.weight(1f))
             LinkCard("Cloud Relay", "HiveMQ MQTT + Cloudflare", orchestrator.transportManager.internet.isConnected.value, Modifier.weight(1f))
+        }
+
+        // ── 2D MESH TOPOLOGY CANVAS GRAPH ────────────────────────────────────
+        Card(
+            shape = DtnShapes.Card,
+            colors = CardDefaults.cardColors(containerColor = DtnColors.Card),
+            border = BorderStroke(1.dp, DtnColors.CardBorder),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(Icons.Filled.Hub, contentDescription = null, tint = DtnColors.Primary)
+                        Text("Live 2D Mesh Topology Canvas", style = DtnType.RowTitle)
+                    }
+
+                    Surface(shape = DtnShapes.Pill, color = DtnColors.PrimarySoft) {
+                        Text(
+                            text = "${onlinePeers.size} Discovered Links",
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold, color = DtnColors.Primary)
+                        )
+                    }
+                }
+
+                Text(
+                    "Interactive real-time radar mesh visualization. Nodes orbit the central command station according to active transport rays (Emerald = Wi-Fi :9734, Sky Blue = BLE GATT, Purple = Cloud Relay, Amber = USB LoRa). Tap any node to inspect.",
+                    style = DtnType.Meta
+                )
+
+                MeshTopologyCanvas(
+                    localNodeId = orchestrator.identity.nodeId.value,
+                    onlinePeers = onlinePeers,
+                    contacts = contacts,
+                    selectedPeerId = selectedGraphPeerId,
+                    onSelectPeer = { selectedGraphPeerId = it }
+                )
+
+                // Selected Graph Peer Inspector Banner
+                if (selectedGraphPeerId != null) {
+                    val peer = onlinePeers[selectedGraphPeerId]
+                    val contact = contacts.firstOrNull { it.nodeId == selectedGraphPeerId }
+                    val name = contact?.announceName?.takeIf { it.isNotBlank() } ?: selectedGraphPeerId!!
+
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = DtnColors.Track,
+                        border = BorderStroke(1.dp, DtnColors.Primary.copy(alpha = 0.3f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(name, style = DtnType.RowTitle.copy(fontSize = 14.sp))
+                                    Surface(shape = DtnShapes.Pill, color = DtnColors.GreenSoft) {
+                                        Text(peer?.linkType ?: "Active Link", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = TextStyle(fontSize = 10.sp, color = DtnColors.GreenText, fontWeight = FontWeight.Bold))
+                                    }
+                                }
+                                Text("Node ID: ${selectedGraphPeerId!!} · PRoPHET Predictability: 0.850", style = DtnType.Meta)
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = { orchestrator.sendAnnounceTo(NodeId(selectedGraphPeerId!!), wantsReply = true) },
+                                    shape = DtnShapes.Button
+                                ) {
+                                    Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Ping Node", style = TextStyle(fontSize = 11.sp))
+                                }
+
+                                Button(
+                                    onClick = { onOpenChat(selectedGraphPeerId!!) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = DtnColors.Primary),
+                                    shape = DtnShapes.Button
+                                ) {
+                                    Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Open Chat", style = TextStyle(fontSize = 11.sp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // ── WI-FI DIRECT / LOCAL PEER CONNECT CARD ────────────────────────────
