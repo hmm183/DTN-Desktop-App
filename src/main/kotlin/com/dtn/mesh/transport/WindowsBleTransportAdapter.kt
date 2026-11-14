@@ -169,12 +169,20 @@ class WindowsBleTransportAdapter(
     }
 
     private fun locateWorkerExe(): File? {
-        val candidates = listOf(
+        val baseDir = try {
+            File(WindowsBleTransportAdapter::class.java.protectionDomain.codeSource.location.toURI()).parentFile
+        } catch (_: Exception) { null }
+
+        val candidates = listOfNotNull(
             File("tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/win-x64/publish/dtn-ble-worker.exe"),
             File("tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/dtn-ble-worker.exe"),
             File(System.getProperty("user.dir"), "tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/win-x64/publish/dtn-ble-worker.exe"),
             File(System.getProperty("user.dir"), "dtn-ble-worker.exe"),
             File(".", "dtn-ble-worker.exe"),
+            File("dtn-ble-worker.exe"),
+            baseDir?.let { File(it, "dtn-ble-worker.exe") },
+            baseDir?.parentFile?.let { File(it, "dtn-ble-worker.exe") },
+            baseDir?.parentFile?.let { File(it, "app/dtn-ble-worker.exe") },
             File(System.getProperty("compose.application.resources.dir", "."), "dtn-ble-worker.exe")
         )
         return candidates.firstOrNull { it.exists() }

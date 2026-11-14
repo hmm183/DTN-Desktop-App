@@ -72,6 +72,14 @@ class DesktopOrchestrator(
         transportManager.stopAll()
     }
 
+    fun connectToWifiPeer(ip: String): Boolean = transportManager.connectToWifiPeer(ip)
+
+    fun triggerSubnetSweep() = transportManager.triggerSubnetSweep()
+
+    fun getLocalIpAddresses(): List<String> = transportManager.getLocalIpAddresses()
+
+    fun restartBle() = transportManager.restartBle()
+
     fun setStrategy(type: StrategyType) {
         _activeStrategy.value = type
         strategySelector.switchTo(type)
@@ -352,8 +360,30 @@ class DesktopOrchestrator(
         scope.launch {
             val buffered = database.bufferedMessages.value
             for (msg in buffered) {
-                transportManager.transmitBundle(msg)
+                val ok = transportManager.transmitBundle(msg)
+                if (ok) {
+                    database.updateChatStatus(msg.id, "SENT")
+                }
             }
+        }
+    }
+
+    fun flushBundleNow(bundle: DtnMessage) {
+        scope.launch {
+            val ok = transportManager.transmitBundle(bundle)
+            if (ok) {
+                database.updateChatStatus(bundle.id, "SENT")
+                lifecycleLog.logEvent(LifecycleEvent.FORWARDED, bundle.id, bundle.originNodeId.value, bundle.destinationNodeId.value, "Transmitted manually via transport")
+            }
+        }
+    }
+
+    fun clearExpiredQueue() {
+        val now = System.currentTimeMillis()
+        val expired = database.bufferedMessages.value.filter { (now - it.createdAtMs) > it.ttlMs }
+        for (msg in expired) {
+            database.removeBufferedMessage(msg.id)
+            lifecycleLog.logEvent(LifecycleEvent.EXPIRED, msg.id, msg.originNodeId.value, msg.destinationNodeId.value, "TTL expired in queue")
         }
     }
 

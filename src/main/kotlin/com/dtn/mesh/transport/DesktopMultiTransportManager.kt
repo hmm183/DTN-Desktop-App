@@ -73,6 +73,17 @@ class DesktopMultiTransportManager(
         println("[MultiTransport] All 5 desktop transports stopped.")
     }
 
+    fun connectToWifiPeer(ip: String): Boolean = wifiDirect.connectToPeerIp(ip)
+
+    fun triggerSubnetSweep() = wifiDirect.triggerSubnetSweep()
+
+    fun getLocalIpAddresses(): List<String> = wifiDirect.getLocalIpAddresses()
+
+    fun restartBle() {
+        ble.stop()
+        ble.start()
+    }
+
     private fun updatePeer(nodeId: String, online: Boolean, linkType: String) {
         val current = _onlinePeers.value.toMutableMap()
         val isNew = !current.containsKey(nodeId)
@@ -88,45 +99,79 @@ class DesktopMultiTransportManager(
     }
 
     /**
-     * Sends bundle out according to transport priority:
-     * 1. USB Serial LoRa Hub (if connected)
-     * 2. Wi-Fi Direct (if peer reachable via P2P IP)
-     * 3. BLE (if peer nearby over BLE)
-     * 4. Wi-Fi SoftAP LoRa Hub (if connected)
-     * 5. Internet Relay (fallback)
+     * Sends bundle out across all available transport paths.
+     * Broadcast bundles are fanned out to all local peers (Wi-Fi, BLE, LoRa, Internet).
+     * Unicast bundles prioritize low-latency local paths (Wi-Fi Direct, BLE) with Internet fallback.
      */
     fun transmitBundle(bundle: DtnMessage): Boolean {
-        // 1. USB Serial LoRa
-        if (usbSerial.isConnected.value) {
-            val ok = usbSerial.sendBundle(bundle)
-            if (ok) return true
+        if (bundle.destinationNodeId == NodeId.BROADCAST) {
+            var sentAny = false
+
+            // Fan out to all connected Wi-Fi peers
+            val wifiIps = wifiDirect.connectedPeers.value.values.toSet()
+            for (ip in wifiIps) {
+                if (wifiDirect.sendBundle(bundle, ip)) sentAny = true
+            }
+
+            // Fan out to all discovered BLE peers
+            val blePeers = ble.discoveredPeers.value.keys.toSet()
+            for (peerId in blePeers) {
+                if (ble.sendBundle(bundle, peerId)) sentAny = true
+            }
+
+            // USB Serial LoRa
+            if (usbSerial.isConnected.value) {
+                if (usbSerial.sendBundle(bundle)) sentAny = true
+            }
+
+            // Wi-Fi SoftAP LoRa
+            if (tcpHub.isConnected.value) {
+                if (tcpHub.sendBundle(bundle)) sentAny = true
+            }
+
+            // Internet Relay (Broadcast)
+            if (internet.isConnected.value) {
+                if (internet.sendBundle(bundle)) sentAny = true
+            }
+
+            return sentAny
         }
 
-        // 2. Wi-Fi Direct
+        // Unicast Bundle
         val targetId = bundle.destinationNodeId.value
+        var sentOk = false
+
+        // 1. Wi-Fi Direct (if peer reachable via P2P / LAN IP)
         val peerIp = wifiDirect.connectedPeers.value[targetId]
         if (peerIp != null) {
             val ok = wifiDirect.sendBundle(bundle, peerIp)
-            if (ok) return true
+            if (ok) sentOk = true
         }
 
-        // 3. BLE
+        // 2. BLE (if peer nearby over BLE)
         if (ble.discoveredPeers.value.containsKey(targetId)) {
             val ok = ble.sendBundle(bundle, targetId)
-            if (ok) return true
+            if (ok) sentOk = true
+        }
+
+        // 3. USB Serial LoRa
+        if (!sentOk && usbSerial.isConnected.value) {
+            val ok = usbSerial.sendBundle(bundle)
+            if (ok) sentOk = true
         }
 
         // 4. Wi-Fi SoftAP LoRa
-        if (tcpHub.isConnected.value) {
+        if (!sentOk && tcpHub.isConnected.value) {
             val ok = tcpHub.sendBundle(bundle)
-            if (ok) return true
+            if (ok) sentOk = true
         }
 
         // 5. Internet Relay
         if (internet.isConnected.value) {
-            return internet.sendBundle(bundle)
+            val ok = internet.sendBundle(bundle)
+            if (ok) sentOk = true
         }
 
-        return false
+        return sentOk
     }
 }

@@ -4,7 +4,6 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
@@ -26,7 +25,6 @@ public class Program
     private static GattLocalCharacteristic? _bundleCharacteristic;
     private static GattLocalCharacteristic? _linkCharacteristic;
 
-    // Buffer for reassembling incoming chunks per client MAC/Session
     private class RxBuffer
     {
         public int TotalLength;
@@ -34,24 +32,30 @@ public class Program
     }
     private static readonly ConcurrentDictionary<string, RxBuffer> _rxBuffers = new();
     private static readonly ConcurrentDictionary<string, BluetoothLEDevice> _connectedCentrals = new();
+    private static readonly ConcurrentDictionary<string, GattCharacteristic> _activeBundleChars = new();
+    private static readonly ConcurrentDictionary<string, GattCharacteristic> _activeLinkChars = new();
+    private static readonly ConcurrentDictionary<string, long> _lastLinkAttempt = new();
+    private static readonly ConcurrentDictionary<string, string> _macToNodeId = new();
+    private static readonly ConcurrentDictionary<string, string> _nodeIdToMac = new();
+
+    private static int _localNodeNum = 0;
+    private static string _localNodeId = "";
+    private static string? _centralPeerId = null;
 
     public static async Task Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
         Console.InputEncoding = Encoding.UTF8;
 
-        int localNodeNum = 0;
-        string localNodeId = "";
-
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--node-num" && i + 1 < args.Length)
             {
-                int.TryParse(args[i + 1], out localNodeNum);
+                int.TryParse(args[i + 1], out _localNodeNum);
             }
             else if (args[i] == "--node-id" && i + 1 < args.Length)
             {
-                localNodeId = args[i + 1];
+                _localNodeId = args[i + 1];
             }
         }
 
@@ -62,7 +66,7 @@ public class Program
             EmitJson("status", new JsonObject
             {
                 ["available"] = true,
-                ["message"] = "BLE GATT Server and Scanner active"
+                ["message"] = "BLE GATT Server & Active Scanner active"
             });
         }
         catch (Exception ex)
@@ -94,7 +98,20 @@ public class Program
                         string mac = node["mac"]?.ToString() ?? "";
                         string wireBase64 = node["wireBase64"]?.ToString() ?? "";
                         string nodeId = node["nodeId"]?.ToString() ?? "";
+                        if (string.IsNullOrEmpty(mac) && !string.IsNullOrEmpty(nodeId))
+                        {
+                            mac = _nodeIdToMac.GetValueOrDefault(nodeId, "");
+                        }
                         _ = SendBundleToPeerAsync(mac, nodeId, wireBase64);
+                    }
+                    else if (cmd == "connect")
+                    {
+                        string mac = node["mac"]?.ToString() ?? "";
+                        if (!string.IsNullOrEmpty(mac) && mac.Contains(":"))
+                        {
+                            ulong addr = ParseMac(mac);
+                            _ = ConnectAndLinkAsync(addr, mac, force: true);
+                        }
                     }
                     else if (cmd == "stop")
                     {
@@ -122,7 +139,7 @@ public class Program
 
         _serviceProvider = result.ServiceProvider;
 
-        // 1. Bundle characteristic
+        // 1. Bundle characteristic (for incoming writes from phones)
         var bundleParams = new GattLocalCharacteristicParameters
         {
             CharacteristicProperties = GattCharacteristicProperties.Write | GattCharacteristicProperties.WriteWithoutResponse,
@@ -136,7 +153,7 @@ public class Program
         _bundleCharacteristic = bundleRes.Characteristic;
         _bundleCharacteristic.WriteRequested += OnBundleWriteRequested;
 
-        // 2. Link characteristic
+        // 2. Link characteristic (for incoming hello/subscriptions from phones)
         var linkParams = new GattLocalCharacteristicParameters
         {
             CharacteristicProperties = GattCharacteristicProperties.Indicate | GattCharacteristicProperties.Notify | GattCharacteristicProperties.Write,
@@ -154,6 +171,24 @@ public class Program
             try
             {
                 var request = await args.GetRequestAsync();
+                var reader = DataReader.FromBuffer(request.Value);
+                byte[] data = new byte[reader.UnconsumedBufferLength];
+                reader.ReadBytes(data);
+
+                // Check for BleHello from phone: [0x01][4B nodeNum BE]
+                if (data.Length >= 5 && data[0] == 0x01)
+                {
+                    int peerNum = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(1, 4));
+                    string peerId = "!" + ((uint)peerNum).ToString("x8");
+                    _centralPeerId = peerId;
+                    EmitJson("discovered", new JsonObject
+                    {
+                        ["nodeId"] = peerId,
+                        ["mac"] = "GATT_CENTRAL",
+                        ["rssi"] = -50
+                    });
+                }
+
                 if (request.Option == GattWriteOption.WriteWithResponse)
                 {
                     request.Respond();
@@ -185,43 +220,8 @@ public class Program
             byte[] data = new byte[reader.UnconsumedBufferLength];
             reader.ReadBytes(data);
 
-            string sessionKey = "default";
-
-            if (data.Length >= 2)
-            {
-                var rx = _rxBuffers.GetOrAdd(sessionKey, _ => new RxBuffer());
-                lock (rx)
-                {
-                    if (rx.TotalLength == 0)
-                    {
-                        // First chunk: [2B totalLen BE][bytes...]
-                        rx.TotalLength = BinaryPrimitives.ReadUInt16BigEndian(data);
-                        rx.Stream.SetLength(0);
-                        if (data.Length > 2)
-                        {
-                            rx.Stream.Write(data, 2, data.Length - 2);
-                        }
-                    }
-                    else
-                    {
-                        // Subsequent chunk
-                        rx.Stream.Write(data, 0, data.Length);
-                    }
-
-                    if (rx.Stream.Length >= rx.TotalLength && rx.TotalLength > 0)
-                    {
-                        byte[] completeWire = rx.Stream.ToArray();
-                        rx.TotalLength = 0;
-                        rx.Stream.SetLength(0);
-
-                        EmitJson("bundle", new JsonObject
-                        {
-                            ["wireBase64"] = Convert.ToBase64String(completeWire),
-                            ["rssi"] = -55
-                        });
-                    }
-                }
-            }
+            string sessionKey = "server_rx";
+            ProcessIncomingChunk(sessionKey, data, -50);
 
             if (request.Option == GattWriteOption.WriteWithResponse)
             {
@@ -260,30 +260,50 @@ public class Program
                 bool hasService = e.Advertisement.ServiceUuids.Contains(ServiceUuid);
                 int? nodeNum = null;
 
-                // Check DataSections for ServiceData (0x16 or 0x21)
+                // Check DataSections for ServiceData (0x16, 0x20, 0x21)
                 foreach (var section in e.Advertisement.DataSections)
                 {
-                    if (section.DataType == 0x16 || section.DataType == 0x21)
-                    {
-                        var reader = DataReader.FromBuffer(section.Data);
-                        byte[] bytes = new byte[reader.UnconsumedBufferLength];
-                        reader.ReadBytes(bytes);
+                    var reader = DataReader.FromBuffer(section.Data);
+                    byte[] bytes = new byte[reader.UnconsumedBufferLength];
+                    reader.ReadBytes(bytes);
 
-                        // If 16-bit UUID or 128-bit UUID matches, extract 4-byte nodeNum
-                        if (bytes.Length >= 4)
+                    if (section.DataType == 0x21 && bytes.Length >= 20)
+                    {
+                        // 128-bit Service Data: 16 bytes UUID + 4 bytes nodeNum32
+                        nodeNum = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(16, 4));
+                        hasService = true;
+                        break;
+                    }
+                    else if (section.DataType == 0x16 && bytes.Length >= 6)
+                    {
+                        // 16-bit Service Data: 2 bytes UUID + 4 bytes nodeNum32
+                        nodeNum = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(2, 4));
+                        hasService = true;
+                        break;
+                    }
+                    else if (bytes.Length >= 4 && (section.DataType == 0x21 || section.DataType == 0x16))
+                    {
+                        if (bytes.Length >= 20)
                         {
-                            nodeNum = BinaryPrimitives.ReadInt32BigEndian(bytes);
-                            hasService = true;
-                            break;
+                            nodeNum = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(16, 4));
                         }
+                        else
+                        {
+                            nodeNum = BinaryPrimitives.ReadInt32BigEndian(bytes.AsSpan(0, 4));
+                        }
+                        hasService = true;
+                        break;
                     }
                 }
 
+                ulong addr = e.BluetoothAddress;
+                string mac = FormatMac(addr);
+
                 if (hasService)
                 {
-                    ulong addr = e.BluetoothAddress;
-                    string mac = FormatMac(addr);
                     string nodeId = nodeNum.HasValue ? "!" + ((uint)nodeNum.Value).ToString("x8") : "!ble_" + mac.Replace(":", "").ToLower();
+                    _macToNodeId[mac] = nodeId;
+                    _nodeIdToMac[nodeId] = mac;
 
                     EmitJson("discovered", new JsonObject
                     {
@@ -291,6 +311,15 @@ public class Program
                         ["mac"] = mac,
                         ["rssi"] = e.RawSignalStrengthInDBm
                     });
+
+                    // Active Central mode: initiate connection to phone if not already linked
+                    long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    long lastAttempt = _lastLinkAttempt.GetValueOrDefault(mac, 0L);
+                    if (!_connectedCentrals.ContainsKey(mac) && (now - lastAttempt > 8_000L))
+                    {
+                        _lastLinkAttempt[mac] = now;
+                        _ = ConnectAndLinkAsync(addr, mac, force: false);
+                    }
                 }
             }
             catch { }
@@ -299,70 +328,225 @@ public class Program
         _watcher.Start();
     }
 
+    private static async Task ConnectAndLinkAsync(ulong addr, string mac, bool force)
+    {
+        try
+        {
+            var device = await BluetoothLEDevice.FromBluetoothAddressAsync(addr);
+            if (device == null) return;
+
+            var servicesRes = await device.GetGattServicesForUuidAsync(ServiceUuid);
+            if (servicesRes.Status != GattCommunicationStatus.Success || servicesRes.Services.Count == 0) return;
+
+            var service = servicesRes.Services[0];
+
+            // 1. Link Characteristic: subscribe to Indications and send BleHello
+            var linkRes = await service.GetCharacteristicsForUuidAsync(LinkCharUuid);
+            if (linkRes.Status == GattCommunicationStatus.Success && linkRes.Characteristics.Count > 0)
+            {
+                var linkChar = linkRes.Characteristics[0];
+
+                // Subscribe to indications for incoming bundles from phone
+                await linkChar.WriteClientCharacteristicConfigurationDescriptorWithResultAsync(
+                    GattClientCharacteristicConfigurationDescriptorValue.Indicate
+                );
+
+                linkChar.ValueChanged += (s, e) =>
+                {
+                    try
+                    {
+                        var reader = DataReader.FromBuffer(e.CharacteristicValue);
+                        byte[] data = new byte[reader.UnconsumedBufferLength];
+                        reader.ReadBytes(data);
+                        ProcessIncomingChunk(mac, data, -55);
+                    }
+                    catch { }
+                };
+
+                // Write BleHello: [0x01][4B localNodeNum BE]
+                var writer = new DataWriter();
+                writer.WriteByte(0x01); // VERSION 1
+                writer.WriteInt32(_localNodeNum);
+                await linkChar.WriteValueWithResultAsync(writer.DetachBuffer(), GattWriteOption.WriteWithResponse);
+
+                _activeLinkChars[mac] = linkChar;
+            }
+
+            // 2. Bundle Characteristic: store for outgoing bundle writes
+            var bundleRes = await service.GetCharacteristicsForUuidAsync(BundleCharUuid);
+            if (bundleRes.Status == GattCommunicationStatus.Success && bundleRes.Characteristics.Count > 0)
+            {
+                _activeBundleChars[mac] = bundleRes.Characteristics[0];
+            }
+
+            _connectedCentrals[mac] = device;
+
+            EmitJson("linkUp", new JsonObject
+            {
+                ["mac"] = mac,
+                ["success"] = true
+            });
+        }
+        catch (Exception ex)
+        {
+            EmitJson("error", new JsonObject { ["error"] = $"ConnectAndLinkAsync ({mac}): {ex.Message}" });
+        }
+    }
+
+    private static void ProcessIncomingChunk(string sessionKey, byte[] data, int rssi)
+    {
+        if (data.Length < 2) return;
+        var rx = _rxBuffers.GetOrAdd(sessionKey, _ => new RxBuffer());
+        lock (rx)
+        {
+            if (rx.TotalLength == 0)
+            {
+                // First chunk: [2B totalLen BE][bytes...]
+                rx.TotalLength = BinaryPrimitives.ReadUInt16BigEndian(data);
+                rx.Stream.SetLength(0);
+                if (data.Length > 2)
+                {
+                    rx.Stream.Write(data, 2, data.Length - 2);
+                }
+            }
+            else
+            {
+                // Subsequent chunk
+                rx.Stream.Write(data, 0, data.Length);
+            }
+
+            if (rx.Stream.Length >= rx.TotalLength && rx.TotalLength > 0)
+            {
+                byte[] completeWire = rx.Stream.ToArray();
+                rx.TotalLength = 0;
+                rx.Stream.SetLength(0);
+
+                EmitJson("bundle", new JsonObject
+                {
+                    ["wireBase64"] = Convert.ToBase64String(completeWire),
+                    ["rssi"] = rssi
+                });
+            }
+        }
+    }
+
     private static async Task SendBundleToPeerAsync(string mac, string nodeId, string wireBase64)
     {
         try
         {
             byte[] wireBytes = Convert.FromBase64String(wireBase64);
-            ulong address = ParseMac(mac);
 
-            using var device = await BluetoothLEDevice.FromBluetoothAddressAsync(address);
-            if (device == null)
+            // If target is GATT_CENTRAL or we don't have a MAC address, send via our GATT server LinkChar indication
+            if (mac == "GATT_CENTRAL" || string.IsNullOrEmpty(mac) || !mac.Contains(":"))
+            {
+                if (_linkCharacteristic != null)
+                {
+                    byte[] framed = new byte[2 + wireBytes.Length];
+                    BinaryPrimitives.WriteUInt16BigEndian(framed, (ushort)wireBytes.Length);
+                    Array.Copy(wireBytes, 0, framed, 2, wireBytes.Length);
+
+                    const int chunkSize = 240;
+                    int offset = 0;
+                    while (offset < framed.Length)
+                    {
+                        int len = Math.Min(chunkSize, framed.Length - offset);
+                        var writer = new DataWriter();
+                        var slice = new byte[len];
+                        Array.Copy(framed, offset, slice, 0, len);
+                        writer.WriteBytes(slice);
+
+                        await _linkCharacteristic.NotifyValueAsync(writer.DetachBuffer());
+                        offset += len;
+                    }
+
+                    EmitJson("sent", new JsonObject
+                    {
+                        ["nodeId"] = nodeId,
+                        ["mac"] = mac,
+                        ["success"] = true
+                    });
+                    return;
+                }
+            }
+
+            // Otherwise, laptop is Central: write to the peripheral's Bundle Characteristic
+            GattCharacteristic? characteristic = _activeBundleChars.GetValueOrDefault(mac);
+
+            if (characteristic == null && mac.Contains(":"))
+            {
+                ulong address = ParseMac(mac);
+                var device = await BluetoothLEDevice.FromBluetoothAddressAsync(address);
+                if (device == null)
+                {
+                    EmitJson("sent", new JsonObject
+                    {
+                        ["nodeId"] = nodeId,
+                        ["mac"] = mac,
+                        ["success"] = false,
+                        ["error"] = "Device could not be opened"
+                    });
+                    return;
+                }
+
+                var gattServices = await device.GetGattServicesForUuidAsync(ServiceUuid);
+                if (gattServices.Status != GattCommunicationStatus.Success || gattServices.Services.Count == 0)
+                {
+                    EmitJson("sent", new JsonObject
+                    {
+                        ["nodeId"] = nodeId,
+                        ["mac"] = mac,
+                        ["success"] = false,
+                        ["error"] = "DTN Service not found on device"
+                    });
+                    return;
+                }
+
+                var service = gattServices.Services[0];
+                var charResult = await service.GetCharacteristicsForUuidAsync(BundleCharUuid);
+                if (charResult.Status != GattCommunicationStatus.Success || charResult.Characteristics.Count == 0)
+                {
+                    EmitJson("sent", new JsonObject
+                    {
+                        ["nodeId"] = nodeId,
+                        ["mac"] = mac,
+                        ["success"] = false,
+                        ["error"] = "Bundle Characteristic not found on device"
+                    });
+                    return;
+                }
+
+                characteristic = charResult.Characteristics[0];
+                _activeBundleChars[mac] = characteristic;
+                _connectedCentrals[mac] = device;
+            }
+
+            if (characteristic == null)
             {
                 EmitJson("sent", new JsonObject
                 {
                     ["nodeId"] = nodeId,
                     ["mac"] = mac,
                     ["success"] = false,
-                    ["error"] = "Device could not be opened"
+                    ["error"] = "No characteristic available"
                 });
                 return;
             }
-
-            var gattServices = await device.GetGattServicesForUuidAsync(ServiceUuid);
-            if (gattServices.Status != GattCommunicationStatus.Success || gattServices.Services.Count == 0)
-            {
-                EmitJson("sent", new JsonObject
-                {
-                    ["nodeId"] = nodeId,
-                    ["mac"] = mac,
-                    ["success"] = false,
-                    ["error"] = "DTN Service not found on device"
-                });
-                return;
-            }
-
-            var service = gattServices.Services[0];
-            var charResult = await service.GetCharacteristicsForUuidAsync(BundleCharUuid);
-            if (charResult.Status != GattCommunicationStatus.Success || charResult.Characteristics.Count == 0)
-            {
-                EmitJson("sent", new JsonObject
-                {
-                    ["nodeId"] = nodeId,
-                    ["mac"] = mac,
-                    ["success"] = false,
-                    ["error"] = "Bundle Characteristic not found on device"
-                });
-                return;
-            }
-
-            var characteristic = charResult.Characteristics[0];
 
             // Frame with [2B totalLen BE][wireBytes]
-            byte[] framed = new byte[2 + wireBytes.Length];
-            BinaryPrimitives.WriteUInt16BigEndian(framed, (ushort)wireBytes.Length);
-            Array.Copy(wireBytes, 0, framed, 2, wireBytes.Length);
+            byte[] framedCentral = new byte[2 + wireBytes.Length];
+            BinaryPrimitives.WriteUInt16BigEndian(framedCentral, (ushort)wireBytes.Length);
+            Array.Copy(wireBytes, 0, framedCentral, 2, wireBytes.Length);
 
-            // Chunking into MTU-3 byte blocks (typically 240 bytes)
-            const int chunkSize = 240;
-            int offset = 0;
+            // Chunking into MTU-3 byte blocks (240 bytes)
+            const int chunkSizeCentral = 240;
+            int offsetCentral = 0;
 
-            while (offset < framed.Length)
+            while (offsetCentral < framedCentral.Length)
             {
-                int len = Math.Min(chunkSize, framed.Length - offset);
+                int len = Math.Min(chunkSizeCentral, framedCentral.Length - offsetCentral);
                 var writer = new DataWriter();
                 var slice = new byte[len];
-                Array.Copy(framed, offset, slice, 0, len);
+                Array.Copy(framedCentral, offsetCentral, slice, 0, len);
                 writer.WriteBytes(slice);
 
                 var writeRes = await characteristic.WriteValueWithResultAsync(writer.DetachBuffer(), GattWriteOption.WriteWithResponse);
@@ -377,7 +561,7 @@ public class Program
                     });
                     return;
                 }
-                offset += len;
+                offsetCentral += len;
             }
 
             EmitJson("sent", new JsonObject
@@ -427,6 +611,10 @@ public class Program
         {
             _watcher?.Stop();
             _serviceProvider?.StopAdvertising();
+            foreach (var dev in _connectedCentrals.Values)
+            {
+                dev.Dispose();
+            }
         }
         catch { }
     }
