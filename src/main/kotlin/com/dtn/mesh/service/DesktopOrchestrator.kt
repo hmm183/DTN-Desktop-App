@@ -48,15 +48,26 @@ class DesktopOrchestrator(
     private val _discoverMode = MutableStateFlow(true)
     val discoverMode: StateFlow<Boolean> = _discoverMode.asStateFlow()
 
+    private val _isDiscoverTransitioning = MutableStateFlow(false)
+    val isDiscoverTransitioning: StateFlow<Boolean> = _isDiscoverTransitioning.asStateFlow()
+
     private val lastAnnounceSentTo = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     fun setDiscoverMode(enabled: Boolean) {
-        _discoverMode.value = enabled
-        if (enabled) {
-            broadcastAnnounce()
-            lifecycleLog.logConsole("Orchestrator", "Discover Mode enabled: broadcasting presence to mesh")
-        } else {
-            lifecycleLog.logConsole("Orchestrator", "Discover Mode disabled: stealth mode active (unsolicited announcements halted)")
+        scope.launch(Dispatchers.IO) {
+            _isDiscoverTransitioning.value = true
+            try {
+                _discoverMode.value = enabled
+                if (enabled) {
+                    broadcastAnnounce()
+                    lifecycleLog.logConsole("Orchestrator", "Discover Mode enabled: broadcasting presence to mesh")
+                } else {
+                    lifecycleLog.logConsole("Orchestrator", "Discover Mode disabled: stealth mode active (unsolicited announcements halted)")
+                }
+                delay(400) // Smooth visual transition period
+            } finally {
+                _isDiscoverTransitioning.value = false
+            }
         }
     }
 
@@ -175,9 +186,20 @@ class DesktopOrchestrator(
         scope.launch {
             val sent = transportManager.transmitBundle(bundle)
             if (sent) {
-                database.updateChatStatus(msgId, "SENT")
-                lifecycleLog.i("Routing", "Dispatched bundle ${msgId.take(8)} across local/relay transports")
-                lifecycleLog.logEvent(LifecycleEvent.FORWARDING, msgId, identity.nodeId.value, destination.value, "Transmitted via transport")
+                val isDirectPeer = destination != NodeId.BROADCAST && (
+                    transportManager.wifiDirect.connectedPeers.value.containsKey(destination.value) ||
+                    transportManager.ble.discoveredPeers.value.containsKey(destination.value)
+                )
+                if (isDirectPeer) {
+                    database.updateChatStatus(msgId, "DELIVERED")
+                    database.removeBufferedMessage(msgId)
+                    lifecycleLog.i("Routing", "Bundle ${msgId.take(8)} delivered directly to ${destination.value}")
+                    lifecycleLog.logEvent(LifecycleEvent.DELIVERED, msgId, identity.nodeId.value, destination.value, "Direct delivery ✓✓")
+                } else {
+                    database.updateChatStatus(msgId, "SENT")
+                    lifecycleLog.i("Routing", "Dispatched bundle ${msgId.take(8)} across local/relay transports")
+                    lifecycleLog.logEvent(LifecycleEvent.FORWARDING, msgId, identity.nodeId.value, destination.value, "Transmitted via transport")
+                }
             } else {
                 lifecycleLog.d("Routing", "Bundle ${msgId.take(8)} stored in carry-buffer waiting for next peer encounter")
             }
@@ -241,19 +263,30 @@ class DesktopOrchestrator(
 
     private fun handleAck(bundle: DtnMessage) {
         val payload = bundle.payloadBytes
+        val candidateIds = mutableListOf<String>()
         if (payload.size >= 16) {
             val count = payload.size / 16
             for (i in 0 until count) {
                 val bb = java.nio.ByteBuffer.wrap(payload, i * 16, 16)
                 val targetMsgId = UUID(bb.long, bb.long).toString()
-                database.updateChatStatus(targetMsgId, "DELIVERED")
-                database.removeBufferedMessage(targetMsgId)
-                lifecycleLog.logEvent(LifecycleEvent.DELIVERED, targetMsgId, bundle.originNodeId.value, identity.nodeId.value, "Receipt ✓✓")
+                candidateIds.add(targetMsgId)
             }
-        } else {
-            val targetMsgId = String(payload, Charsets.UTF_8).trim()
+        }
+        val textId = String(payload, Charsets.UTF_8).trim()
+        if (textId.isNotBlank()) {
+            candidateIds.add(textId)
+        }
+
+        val allBuffered = database.bufferedMessages.value
+        for (targetMsgId in candidateIds) {
             database.updateChatStatus(targetMsgId, "DELIVERED")
             database.removeBufferedMessage(targetMsgId)
+            // Also match partial UUID prefix or short IDs
+            val matched = allBuffered.filter { it.id.startsWith(targetMsgId) || targetMsgId.startsWith(it.id.take(8)) }
+            for (m in matched) {
+                database.updateChatStatus(m.id, "DELIVERED")
+                database.removeBufferedMessage(m.id)
+            }
             lifecycleLog.logEvent(LifecycleEvent.DELIVERED, targetMsgId, bundle.originNodeId.value, identity.nodeId.value, "Receipt ✓✓")
         }
     }
@@ -322,6 +355,12 @@ class DesktopOrchestrator(
                 )
             )
 
+            // Trigger native Windows desktop notification to user
+            val senderName = contact?.announceName?.takeIf { it.isNotBlank() } ?: bundle.originNodeId.value
+            val notifTitle = if (isBroadcast) "Broadcast from $senderName" else "Message from $senderName"
+            val notifPreview = if (text.length > 80) text.take(80) + "…" else text
+            com.dtn.desktop.notification.DesktopNotifier.notify(notifTitle, notifPreview)
+
             // If it was addressed specifically to me, send back an end-to-end receipt (ROUTING_ACK)
             if (isForMe) {
                 sendReceipt(bundle.originNodeId, bundle.id)
@@ -387,7 +426,16 @@ class DesktopOrchestrator(
             for (msg in buffered) {
                 val ok = transportManager.transmitBundle(msg)
                 if (ok) {
-                    database.updateChatStatus(msg.id, "SENT")
+                    val isDirectPeer = msg.destinationNodeId != NodeId.BROADCAST && (
+                        transportManager.wifiDirect.connectedPeers.value.containsKey(msg.destinationNodeId.value) ||
+                        transportManager.ble.discoveredPeers.value.containsKey(msg.destinationNodeId.value)
+                    )
+                    if (isDirectPeer) {
+                        database.updateChatStatus(msg.id, "DELIVERED")
+                        database.removeBufferedMessage(msg.id)
+                    } else {
+                        database.updateChatStatus(msg.id, "SENT")
+                    }
                 }
             }
         }
@@ -397,8 +445,18 @@ class DesktopOrchestrator(
         scope.launch {
             val ok = transportManager.transmitBundle(bundle)
             if (ok) {
-                database.updateChatStatus(bundle.id, "SENT")
-                lifecycleLog.logEvent(LifecycleEvent.FORWARDED, bundle.id, bundle.originNodeId.value, bundle.destinationNodeId.value, "Transmitted manually via transport")
+                val isDirectPeer = bundle.destinationNodeId != NodeId.BROADCAST && (
+                    transportManager.wifiDirect.connectedPeers.value.containsKey(bundle.destinationNodeId.value) ||
+                    transportManager.ble.discoveredPeers.value.containsKey(bundle.destinationNodeId.value)
+                )
+                if (isDirectPeer) {
+                    database.updateChatStatus(bundle.id, "DELIVERED")
+                    database.removeBufferedMessage(bundle.id)
+                    lifecycleLog.logEvent(LifecycleEvent.DELIVERED, bundle.id, bundle.originNodeId.value, bundle.destinationNodeId.value, "Delivered directly ✓✓")
+                } else {
+                    database.updateChatStatus(bundle.id, "SENT")
+                    lifecycleLog.logEvent(LifecycleEvent.FORWARDED, bundle.id, bundle.originNodeId.value, bundle.destinationNodeId.value, "Transmitted manually via transport")
+                }
             }
         }
     }

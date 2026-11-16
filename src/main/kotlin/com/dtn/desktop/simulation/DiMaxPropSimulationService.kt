@@ -3,7 +3,11 @@ package com.dtn.desktop.simulation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URI
 import java.util.Scanner
+import java.util.zip.ZipInputStream
 
 data class SimScenarioInfo(
     val id: String,
@@ -45,19 +49,140 @@ class DiMaxPropSimulationService(
     private val appBaseDir: File = File(System.getProperty("user.dir"))
 ) {
     val simDir: File by lazy {
-        // Look in tools/sim-dimaxprop relative to user.dir or app install directory
-        val candidates = listOf(
+        val appDataSim = File(System.getProperty("user.home"), ".dtnmesh/sim-dimaxprop")
+        val baseDir = try {
+            File(DiMaxPropSimulationService::class.java.protectionDomain.codeSource.location.toURI()).parentFile
+        } catch (_: Exception) { null }
+
+        val candidates = listOfNotNull(
             File(appBaseDir, "tools/sim-dimaxprop"),
+            baseDir?.let { File(it, "tools/sim-dimaxprop") },
+            baseDir?.parentFile?.let { File(it, "tools/sim-dimaxprop") },
+            baseDir?.parentFile?.let { File(it, "app/tools/sim-dimaxprop") },
             File(appBaseDir, "../tools/sim-dimaxprop"),
-            File("C:/Users/vrish/Desktop/DTN-Desktop-App/tools/sim-dimaxprop"),
-            File("C:/Users/vrish/Desktop/DTN-Simulation-DiMaxProp")
+            appDataSim,
+            File(appBaseDir, "sim-dimaxprop")
         )
-        candidates.firstOrNull { it.exists() && File(it, "target").exists() }
+        candidates.firstOrNull { it.exists() && File(it, "target/core/DTNSim.class").exists() }
             ?: candidates.firstOrNull { it.exists() }
             ?: File(appBaseDir, "tools/sim-dimaxprop")
     }
 
     fun isAvailable(): Boolean = File(simDir, "target/core/DTNSim.class").exists()
+
+    suspend fun ensureSimulatorInstalled(onProgress: (String) -> Unit = {}): Boolean = withContext(Dispatchers.IO) {
+        if (isAvailable()) {
+            onProgress("ONE Simulation Engine ready.")
+            return@withContext true
+        }
+
+        // 1. If simDir exists with src/core/DTNSim.java, compile it!
+        val srcFile = File(simDir, "src/core/DTNSim.java")
+        if (srcFile.exists()) {
+            onProgress("Compiling ONE Simulator classes...")
+            val success = compileSimulatorInDir(simDir, onProgress)
+            if (success && isAvailable()) {
+                onProgress("ONE Simulation Engine ready.")
+                return@withContext true
+            }
+        }
+
+        // 2. If missing, setup in ~/.dtnmesh/sim-dimaxprop
+        val appDataSim = File(System.getProperty("user.home"), ".dtnmesh/sim-dimaxprop")
+        if (!File(appDataSim, "target/core/DTNSim.class").exists()) {
+            onProgress("Downloading ONE simulator package...")
+            val downloaded = downloadAndExtractSimulator(appDataSim, onProgress)
+            if (downloaded) {
+                if (File(appDataSim, "src/core/DTNSim.java").exists() && !File(appDataSim, "target/core/DTNSim.class").exists()) {
+                    onProgress("Compiling downloaded simulator classes...")
+                    compileSimulatorInDir(appDataSim, onProgress)
+                }
+            }
+        }
+
+        val ready = isAvailable() || File(appDataSim, "target/core/DTNSim.class").exists()
+        if (ready) {
+            onProgress("ONE Simulation Engine ready.")
+        } else {
+            onProgress("Simulation Engine compilation failed.")
+        }
+        ready
+    }
+
+    private fun compileSimulatorInDir(dir: File, onProgress: (String) -> Unit): Boolean {
+        return try {
+            val compileBat = File(dir, "compile.bat")
+            if (System.getProperty("os.name").lowercase().contains("windows") && compileBat.exists()) {
+                onProgress("Running compile.bat...")
+                val pb = ProcessBuilder("cmd.exe", "/c", "compile.bat")
+                pb.directory(dir)
+                pb.redirectErrorStream(true)
+                val proc = pb.start()
+                proc.waitFor(60, java.util.concurrent.TimeUnit.SECONDS)
+                File(dir, "target/core/DTNSim.class").exists()
+            } else {
+                onProgress("Compiling Java sources...")
+                val targetDir = File(dir, "target").apply { mkdirs() }
+                val javacCmd = findJavacCommand()
+                val libCp = "lib/ECLA.jar${File.pathSeparator}lib/DTNConsoleConnection.jar"
+                val javaFiles = dir.resolve("src").walkTopDown().filter { it.extension == "java" }.map { it.absolutePath }.toList()
+                if (javaFiles.isEmpty()) return false
+                val args = mutableListOf(javacCmd, "-encoding", "UTF-8", "-sourcepath", "src", "-d", targetDir.absolutePath, "-cp", libCp)
+                args.addAll(javaFiles)
+                val pb = ProcessBuilder(args)
+                pb.directory(dir)
+                val proc = pb.start()
+                proc.waitFor(60, java.util.concurrent.TimeUnit.SECONDS)
+                File(dir, "target/core/DTNSim.class").exists()
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun downloadAndExtractSimulator(destDir: File, onProgress: (String) -> Unit): Boolean {
+        destDir.mkdirs()
+        val zipUrls = listOf(
+            "https://raw.githubusercontent.com/hmm183/DTN-Desktop-App/main/tools/sim-dimaxprop.zip",
+            "https://github.com/hmm183/DTN-Desktop-App/releases/latest/download/sim-dimaxprop.zip"
+        )
+        for (urlStr in zipUrls) {
+            try {
+                var currentUrl = urlStr
+                for (redirect in 0..5) {
+                    val url = URI.create(currentUrl).toURL()
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.instanceFollowRedirects = true
+                    conn.connectTimeout = 10_000
+                    conn.readTimeout = 30_000
+                    conn.setRequestProperty("User-Agent", "DTNDesktopApp/1.0.0")
+                    val code = conn.responseCode
+                    if (code in 301..308) {
+                        val loc = conn.getHeaderField("Location") ?: break
+                        currentUrl = loc
+                        continue
+                    }
+                    if (code != 200) break
+
+                    ZipInputStream(conn.inputStream).use { zis ->
+                        var entry = zis.nextEntry
+                        while (entry != null) {
+                            val file = File(destDir, entry.name)
+                            if (entry.isDirectory) {
+                                file.mkdirs()
+                            } else {
+                                file.parentFile?.mkdirs()
+                                FileOutputStream(file).use { out -> zis.copyTo(out) }
+                            }
+                            entry = zis.nextEntry
+                        }
+                    }
+                    return true
+                }
+            } catch (_: Exception) {}
+        }
+        return false
+    }
 
     fun listScenarios(): List<SimScenarioInfo> = listOf(
         SimScenarioInfo(
@@ -295,6 +420,29 @@ class DiMaxPropSimulationService(
     private fun Double.format(decimals: Int): String = String.format(java.util.Locale.US, "%.${decimals}f", this)
 
     private fun findJavaCommand(): String {
+        val javaHome = System.getProperty("java.home")
+        if (javaHome != null) {
+            val exe = File(javaHome, "bin/java.exe")
+            if (exe.exists()) return exe.absolutePath
+            val bin = File(javaHome, "bin/java")
+            if (bin.exists()) return bin.absolutePath
+        }
         return "java"
+    }
+
+    private fun findJavacCommand(): String {
+        val javaHome = System.getProperty("java.home")
+        if (javaHome != null) {
+            val exe = File(javaHome, "bin/javac.exe")
+            if (exe.exists()) return exe.absolutePath
+            val parent = File(javaHome, "../bin/javac.exe")
+            if (parent.exists()) return parent.canonicalPath
+        }
+        val pathDirs = System.getenv("PATH")?.split(File.pathSeparator).orEmpty()
+        for (dir in pathDirs) {
+            val f = File(dir, "javac.exe")
+            if (f.exists()) return f.absolutePath
+        }
+        return "javac"
     }
 }

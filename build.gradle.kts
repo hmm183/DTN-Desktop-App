@@ -93,11 +93,24 @@ compose.desktop {
 
 val buildBleWorker by tasks.registering(Exec::class) {
     workingDir = file("tools/ble-worker")
-    commandLine("dotnet", "publish", "-c", "Release", "-r", "win-x64", "--self-contained", "false")
+    val userDotnet = file("${System.getProperty("user.home")}/.dotnet/dotnet.exe")
+    val dotnetCmd = if (userDotnet.exists()) userDotnet.absolutePath else "dotnet"
+    commandLine(dotnetCmd, "publish", "-c", "Release", "-r", "win-x64", "--self-contained", "true")
+    isIgnoreExitValue = true
+}
+
+val compileSimulator by tasks.registering(Exec::class) {
+    workingDir = file("tools/sim-dimaxprop")
+    if (System.getProperty("os.name").lowercase().contains("windows")) {
+        commandLine("cmd", "/c", "compile.bat")
+    } else {
+        commandLine("sh", "compile.sh")
+    }
+    isIgnoreExitValue = true
 }
 
 tasks.named("processResources") {
-    dependsOn(buildBleWorker)
+    dependsOn(buildBleWorker, compileSimulator)
     doLast {
         val srcExe = file("tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/win-x64/publish/dtn-ble-worker.exe")
         if (srcExe.exists()) {

@@ -31,6 +31,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -114,6 +115,7 @@ fun main() {
         val orchestrator = remember { DesktopOrchestrator(identity, database, lifecycleLog) }
 
         LaunchedEffect(Unit) {
+            com.dtn.desktop.notification.DesktopNotifier.init()
             orchestrator.start()
         }
 
@@ -156,6 +158,12 @@ fun DesktopAppScreen(
     val activeStrategy by orchestrator.activeStrategy.collectAsState()
     val journalEntries by lifecycleLog.entries.collectAsState()
 
+    LaunchedEffect(activeTab, selectedConvKey) {
+        if (activeTab == DesktopNavTab.CHATS) {
+            database.markConversationAsRead(selectedConvKey)
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
         // ── TOP NAVIGATION & STATUS BAR ───────────────────────────────────────
         TopNavigationBar(
@@ -181,7 +189,12 @@ fun DesktopAppScreen(
                     contacts = contacts,
                     onlinePeers = onlinePeers,
                     selectedConvKey = selectedConvKey,
-                    onSelectConversation = { selectedConvKey = it },
+                    onSelectConversation = {
+                        selectedConvKey = it
+                        activeTab = DesktopNavTab.CHATS
+                        database.markConversationAsRead(it)
+                    },
+                    chatMessages = chatMessages,
                     bufferedCount = bufferedMessages.size,
                     journalCount = journalEntries.size,
                     onAddContact = { id, name ->
@@ -210,6 +223,9 @@ fun DesktopAppScreen(
                                     messages = chatMessages.filter { it.convKey == selectedConvKey },
                                     contacts = contacts,
                                     onlinePeers = onlinePeers,
+                                    onMarkAsRead = {
+                                        database.markConversationAsRead(selectedConvKey)
+                                    },
                                     onSendMessage = { text ->
                                         val dest = if (selectedConvKey == "^all") NodeId.BROADCAST else NodeId(selectedConvKey)
                                         orchestrator.sendTextMessage(dest, text)
@@ -247,7 +263,13 @@ fun DesktopAppScreen(
                         QueueInspectorView(
                             buffered = bufferedMessages,
                             orchestrator = orchestrator,
-                            contacts = contacts
+                            contacts = contacts,
+                            database = database,
+                            onOpenChat = { peerId ->
+                                selectedConvKey = peerId
+                                activeTab = DesktopNavTab.CHATS
+                                database.markConversationAsRead(peerId)
+                            }
                         )
                     }
                     DesktopNavTab.NETWORK -> {
@@ -258,6 +280,7 @@ fun DesktopAppScreen(
                             onOpenChat = { peerId ->
                                 selectedConvKey = peerId
                                 activeTab = DesktopNavTab.CHATS
+                                database.markConversationAsRead(peerId)
                             }
                         )
                     }
@@ -307,6 +330,7 @@ fun TopNavigationBar(
     val wifiListening by orchestrator.transportManager.wifiDirect.isListening.collectAsState()
     val internetConnected by orchestrator.transportManager.internet.isConnected.collectAsState()
     val discoverMode by orchestrator.discoverMode.collectAsState()
+    val isDiscoverTransitioning by orchestrator.isDiscoverTransitioning.collectAsState()
 
     var linkCopiedNotification by remember { mutableStateOf(false) }
 
@@ -388,7 +412,7 @@ fun TopNavigationBar(
                     shape = DtnShapes.Pill,
                     color = if (discoverMode) DtnColors.GreenSoft else DtnColors.GreySoft,
                     border = BorderStroke(1.dp, if (discoverMode) DtnColors.Green.copy(alpha = 0.4f) else DtnColors.CardBorder),
-                    modifier = Modifier.height(36.dp).clip(DtnShapes.Pill).clickable {
+                    modifier = Modifier.height(36.dp).clip(DtnShapes.Pill).clickable(enabled = !isDiscoverTransitioning) {
                         orchestrator.setDiscoverMode(!discoverMode)
                     }
                 ) {
@@ -397,14 +421,27 @@ fun TopNavigationBar(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(7.dp)
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(if (discoverMode) DtnColors.Green else DtnColors.TextHint)
-                        )
+                        if (isDiscoverTransitioning) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(10.dp),
+                                color = if (discoverMode) DtnColors.TextHint else DtnColors.Green,
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(if (discoverMode) DtnColors.Green else DtnColors.TextHint)
+                            )
+                        }
                         Text(
-                            text = if (discoverMode) "Discover: ON" else "Discover: OFF",
+                            text = when {
+                                isDiscoverTransitioning && !discoverMode -> "Activating..."
+                                isDiscoverTransitioning && discoverMode -> "Turning Off..."
+                                discoverMode -> "Discover: ON"
+                                else -> "Discover: OFF"
+                            },
                             style = TextStyle(
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
@@ -413,6 +450,7 @@ fun TopNavigationBar(
                         )
                         Switch(
                             checked = discoverMode,
+                            enabled = !isDiscoverTransitioning,
                             onCheckedChange = { orchestrator.setDiscoverMode(it) },
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = DtnColors.Green,
@@ -538,6 +576,7 @@ fun LeftSidebar(
     onlinePeers: Map<String, Any>,
     selectedConvKey: String,
     onSelectConversation: (String) -> Unit,
+    chatMessages: List<ChatMessage> = emptyList(),
     bufferedCount: Int,
     journalCount: Int,
     onAddContact: (String, String) -> Unit,
@@ -641,13 +680,26 @@ fun LeftSidebar(
         LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             // Pinned Broadcast Channel
             item {
+                val broadcastMsgs = chatMessages.filter { it.convKey == "^all" }
+                val unreadBroadcast = broadcastMsgs.count { it.direction == "IN" && it.status == "RECEIVED" }
+                val lastBroadcast = broadcastMsgs.maxByOrNull { it.createdAtMs }
+                val broadcastSubtitle = when {
+                    unreadBroadcast > 0 && lastBroadcast != null -> lastBroadcast.text
+                    lastBroadcast != null -> {
+                        val pfx = if (lastBroadcast.direction == "OUT") "You: " else ""
+                        pfx + lastBroadcast.text
+                    }
+                    else -> "Public mesh flood (^all)"
+                }
+
                 ConversationRowItem(
                     title = "Broadcast Channel",
-                    subtitle = "Public mesh flood (^all)",
+                    subtitle = broadcastSubtitle,
                     avatarColor = DtnColors.GroupAvatar,
                     initial = "📢",
                     isSelected = selectedConvKey == "^all",
                     isOnline = true,
+                    unreadCount = unreadBroadcast,
                     onClick = { onSelectConversation("^all") }
                 )
             }
@@ -661,13 +713,27 @@ fun LeftSidebar(
             items(filteredContacts) { contact ->
                 val isOnline = onlinePeers.containsKey(contact.nodeId)
                 val displayName = contact.announceName?.takeIf { it.isNotBlank() } ?: contact.nodeId
+                val cMsgs = chatMessages.filter { it.convKey == contact.nodeId }
+                val unreadCount = cMsgs.count { it.direction == "IN" && it.status == "RECEIVED" }
+                val lastMsg = cMsgs.maxByOrNull { it.createdAtMs }
+                val subtitle = when {
+                    unreadCount > 0 && lastMsg != null -> lastMsg.text
+                    lastMsg != null -> {
+                        val pfx = if (lastMsg.direction == "OUT") "You: " else ""
+                        pfx + lastMsg.text
+                    }
+                    isOnline -> "● Online nearby"
+                    else -> contact.nodeId
+                }
+
                 ConversationRowItem(
                     title = displayName,
-                    subtitle = if (isOnline) "● Online nearby" else contact.nodeId,
+                    subtitle = subtitle,
                     avatarColor = DtnColors.avatarFor(contact.nodeId),
                     initial = contact.announceName?.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
                     isSelected = selectedConvKey == contact.nodeId,
                     isOnline = isOnline,
+                    unreadCount = unreadCount,
                     onClick = { onSelectConversation(contact.nodeId) }
                 )
             }
@@ -708,6 +774,7 @@ fun ConversationRowItem(
     initial: String,
     isSelected: Boolean,
     isOnline: Boolean,
+    unreadCount: Int = 0,
     onClick: () -> Unit,
 ) {
     Surface(
@@ -744,18 +811,50 @@ fun ConversationRowItem(
             }
 
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = title,
-                    style = DtnType.RowTitle.copy(
-                        fontSize = 13.sp,
-                        color = if (isSelected) DtnColors.Primary else DtnColors.TextTitle
-                    ),
-                    maxLines = 1
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = title,
+                        style = DtnType.RowTitle.copy(
+                            fontSize = 13.sp,
+                            fontWeight = if (unreadCount > 0) FontWeight.Bold else FontWeight.SemiBold,
+                            color = if (isSelected) DtnColors.Primary else DtnColors.TextTitle
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (unreadCount > 0) {
+                        Surface(
+                            shape = CircleShape,
+                            color = DtnColors.Primary,
+                            modifier = Modifier.padding(start = 6.dp)
+                        ) {
+                            Text(
+                                text = if (unreadCount > 99) "99+" else "$unreadCount",
+                                style = TextStyle(
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                ),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(2.dp))
                 Text(
                     text = subtitle,
-                    style = DtnType.RowSubtitle.copy(fontSize = 11.sp),
-                    maxLines = 1
+                    style = DtnType.RowSubtitle.copy(
+                        fontSize = 11.sp,
+                        fontWeight = if (unreadCount > 0) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (unreadCount > 0) DtnColors.TextTitle else DtnColors.TextSubtitle
+                    ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
         }
@@ -773,11 +872,18 @@ fun ChatView(
     onMessageClick: (ChatMessage) -> Unit,
     onClearChat: (() -> Unit)? = null,
     onPingPeer: (() -> Unit)? = null,
+    onMarkAsRead: (() -> Unit)? = null,
 ) {
     var textInput by remember(convKey) { mutableStateOf("") }
     var showClearConfirm by remember(convKey) { mutableStateOf(false) }
     var pingSentNotification by remember(convKey) { mutableStateOf(false) }
     val listState = rememberLazyListState()
+
+    LaunchedEffect(messages.size) {
+        if (messages.any { it.direction == "IN" && it.status == "RECEIVED" }) {
+            onMarkAsRead?.invoke()
+        }
+    }
 
     val peerContact = contacts.firstOrNull { it.nodeId == convKey }
     val isBroadcast = convKey == "^all"
@@ -1853,7 +1959,9 @@ fun NodeInspectorPanel(
 fun QueueInspectorView(
     buffered: List<DtnMessage>,
     orchestrator: DesktopOrchestrator,
-    contacts: List<Contact>
+    contacts: List<Contact>,
+    database: DesktopDatabase? = null,
+    onOpenChat: ((String) -> Unit)? = null
 ) {
     var searchQuery by remember { mutableStateOf("") }
     var expandedBundleId by remember { mutableStateOf<String?>(null) }
@@ -2002,11 +2110,32 @@ fun QueueInspectorView(
                                         Spacer(Modifier.width(4.dp))
                                         Text("Transmit Now", style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Bold))
                                     }
+
+                                    if (database != null) {
+                                        OutlinedButton(
+                                            onClick = { database.removeBufferedMessage(bundle.id) },
+                                            shape = DtnShapes.Button,
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                            border = BorderStroke(1.dp, DtnColors.CardBorder),
+                                            modifier = Modifier.height(30.dp)
+                                        ) {
+                                            Icon(Icons.Filled.Close, contentDescription = "Dismiss from Queue", modifier = Modifier.size(13.dp), tint = DtnColors.TextHint)
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("Dismiss", style = TextStyle(fontSize = 11.sp, color = DtnColors.TextSubtitle))
+                                        }
+                                    }
                                 }
                             }
 
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text("Destination: $destName (${bundle.destinationNodeId.value})", style = DtnType.Meta)
+                                Text(
+                                    text = "Destination: $destName (${bundle.destinationNodeId.value})",
+                                    style = DtnType.Meta.copy(color = if (onOpenChat != null) DtnColors.Primary else DtnColors.TextSubtitle),
+                                    modifier = if (onOpenChat != null) Modifier.clickable {
+                                        val dest = bundle.destinationNodeId.value
+                                        onOpenChat(if (dest == NodeId.BROADCAST.value) "^all" else dest)
+                                    } else Modifier
+                                )
                                 Text("${remainingMs / 60000}m remaining / ${bundle.ttlMs / 60000}m total", style = DtnType.Meta.copy(color = ttlColor, fontWeight = FontWeight.SemiBold))
                             }
 
@@ -2323,7 +2452,11 @@ fun NetworkTopologyView(
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
                                     // Left: Avatar + Names + Connection Tag
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        modifier = Modifier.clickable { onOpenChat(peer.nodeId) }
+                                    ) {
                                         Box(contentAlignment = Alignment.BottomEnd) {
                                             Surface(
                                                 shape = CircleShape,

@@ -24,6 +24,10 @@ import java.io.OutputStreamWriter
 import java.util.Base64
 import java.util.UUID
 
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URI
+
 /**
  * Windows BLE Transport Adapter.
  *
@@ -64,16 +68,23 @@ class WindowsBleTransportAdapter(
     private val json = Json { ignoreUnknownKeys = true }
 
     fun start() {
-        val workerExe = locateWorkerExe()
-        if (workerExe == null || !workerExe.exists()) {
-            println("[WindowsBle] Warning: dtn-ble-worker.exe not found. BLE hardware integration will remain passive.")
-            _isBleAvailable.value = false
-            return
-        }
-
         scope.launch {
             try {
+                var workerExe = locateWorkerExe()
+                if (workerExe == null || !workerExe.exists()) {
+                    lifecycleLog?.i("BLE", "Native BLE worker not found locally. Attempting automatic extraction / download...")
+                    workerExe = ensureWorkerExe()
+                }
+
+                if (workerExe == null || !workerExe.exists()) {
+                    println("[WindowsBle] Warning: dtn-ble-worker.exe could not be resolved or downloaded. BLE will remain passive.")
+                    lifecycleLog?.w("BLE", "dtn-ble-worker.exe could not be found or installed. BLE hardware integration will remain passive.")
+                    _isBleAvailable.value = false
+                    return@launch
+                }
+
                 println("[WindowsBle] Starting BLE bridge worker: ${workerExe.absolutePath}")
+                lifecycleLog?.i("BLE", "Starting BLE bridge worker (${workerExe.name})")
                 val pb = ProcessBuilder(
                     workerExe.absolutePath,
                     "--node-id", localNodeId.value,
@@ -98,6 +109,7 @@ class WindowsBleTransportAdapter(
                 }
             } catch (e: Exception) {
                 println("[WindowsBle] Worker error: ${e.message}")
+                lifecycleLog?.e("BLE", "Worker error: ${e.message}")
                 _isBleAvailable.value = false
             }
         }
@@ -210,10 +222,13 @@ class WindowsBleTransportAdapter(
             File(WindowsBleTransportAdapter::class.java.protectionDomain.codeSource.location.toURI()).parentFile
         } catch (_: Exception) { null }
 
+        val userAppDataBin = File(System.getProperty("user.home"), ".dtnmesh/bin")
+
         val candidates = listOfNotNull(
             File("tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/win-x64/publish/dtn-ble-worker.exe"),
             File("tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/dtn-ble-worker.exe"),
             File(System.getProperty("user.dir"), "tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/win-x64/publish/dtn-ble-worker.exe"),
+            File(userAppDataBin, "dtn-ble-worker.exe"),
             File(System.getProperty("user.dir"), "dtn-ble-worker.exe"),
             File(".", "dtn-ble-worker.exe"),
             File("dtn-ble-worker.exe"),
@@ -222,6 +237,100 @@ class WindowsBleTransportAdapter(
             baseDir?.parentFile?.let { File(it, "app/dtn-ble-worker.exe") },
             File(System.getProperty("compose.application.resources.dir", "."), "dtn-ble-worker.exe")
         )
-        return candidates.firstOrNull { it.exists() }
+        return candidates.firstOrNull { it.exists() && it.length() > 50_000L }
+    }
+
+    private fun ensureWorkerExe(): File? {
+        val userAppDataBin = File(System.getProperty("user.home"), ".dtnmesh/bin").apply { mkdirs() }
+        val targetWorker = File(userAppDataBin, "dtn-ble-worker.exe")
+        if (targetWorker.exists() && targetWorker.length() > 50_000L) {
+            return targetWorker
+        }
+
+        // 1. Try extracting from classpath / JAR resources
+        try {
+            val resStream = javaClass.getResourceAsStream("/dtn-ble-worker.exe")
+                ?: Thread.currentThread().contextClassLoader?.getResourceAsStream("dtn-ble-worker.exe")
+            if (resStream != null) {
+                lifecycleLog?.i("BLE", "Extracting bundled native BLE bridge worker...")
+                resStream.use { input ->
+                    targetWorker.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                if (targetWorker.exists() && targetWorker.length() > 50_000L) {
+                    return targetWorker
+                }
+            }
+        } catch (_: Exception) {}
+
+        // 2. Try compiling locally if dotnet & BleWorker.csproj exist
+        try {
+            val csproj = File("tools/ble-worker/BleWorker.csproj")
+            if (csproj.exists()) {
+                val userDotnet = File(System.getProperty("user.home"), ".dotnet/dotnet.exe")
+                val dotnetCmd = if (userDotnet.exists()) userDotnet.absolutePath else "dotnet"
+                lifecycleLog?.i("BLE", "Attempting local compilation of BLE worker via $dotnetCmd...")
+                val pb = ProcessBuilder(dotnetCmd, "publish", "-c", "Release", "-r", "win-x64", "--self-contained", "true", csproj.absolutePath)
+                pb.redirectErrorStream(true)
+                val proc = pb.start()
+                proc.waitFor(60, java.util.concurrent.TimeUnit.SECONDS)
+                val published = locateWorkerExe()
+                if (published != null && published.exists()) return published
+            }
+        } catch (_: Exception) {}
+
+        // 3. Auto-download prebuilt worker binary
+        val downloadUrls = listOf(
+            "https://raw.githubusercontent.com/hmm183/DTN-Desktop-App/main/tools/ble-worker/bin/Release/net9.0-windows10.0.19041.0/win-x64/publish/dtn-ble-worker.exe",
+            "https://github.com/hmm183/DTN-Desktop-App/releases/latest/download/dtn-ble-worker.exe"
+        )
+        for (url in downloadUrls) {
+            try {
+                lifecycleLog?.i("BLE", "Downloading native BLE worker component from $url...")
+                if (downloadFile(url, targetWorker)) {
+                    lifecycleLog?.i("BLE", "BLE worker successfully downloaded (${targetWorker.length() / 1024} KB).")
+                    return targetWorker
+                }
+            } catch (e: Exception) {
+                lifecycleLog?.w("BLE", "Download failed from $url: ${e.message}")
+            }
+        }
+
+        return locateWorkerExe()
+    }
+
+    private fun downloadFile(urlStr: String, destFile: File): Boolean {
+        var currentUrl = urlStr
+        for (redirect in 0..5) {
+            val url = URI.create(currentUrl).toURL()
+            val conn = url.openConnection() as HttpURLConnection
+            conn.instanceFollowRedirects = true
+            conn.connectTimeout = 10_000
+            conn.readTimeout = 30_000
+            conn.setRequestProperty("User-Agent", "DTNDesktopApp/1.0.0")
+            val code = conn.responseCode
+            if (code in 301..308) {
+                val loc = conn.getHeaderField("Location") ?: return false
+                currentUrl = loc
+                continue
+            }
+            if (code != 200) return false
+            destFile.parentFile?.mkdirs()
+            val tmpFile = File(destFile.parentFile, destFile.name + ".tmp")
+            conn.inputStream.use { input ->
+                tmpFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            if (tmpFile.length() > 50_000L) {
+                if (destFile.exists()) destFile.delete()
+                return tmpFile.renameTo(destFile)
+            } else {
+                tmpFile.delete()
+                return false
+            }
+        }
+        return false
     }
 }

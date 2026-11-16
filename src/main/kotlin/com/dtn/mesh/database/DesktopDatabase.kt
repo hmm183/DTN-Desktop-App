@@ -210,10 +210,20 @@ class DesktopDatabase(
 
     fun updateChatStatus(msgId: String, status: String) {
         getConnection().use { conn ->
-            val ps = conn.prepareStatement("UPDATE chat_messages SET status = ? WHERE id = ?")
+            val ps = conn.prepareStatement("UPDATE chat_messages SET status = ? WHERE id = ? AND direction = 'OUT'")
             ps.setString(1, status)
             ps.setString(2, msgId)
             ps.executeUpdate()
+
+            // If message is DELIVERED, automatically purge it from store-carry-forward queue!
+            if (status == "DELIVERED") {
+                val delPs = conn.prepareStatement("DELETE FROM messages WHERE id = ?")
+                delPs.setString(1, msgId)
+                delPs.executeUpdate()
+            }
+        }
+        if (status == "DELIVERED") {
+            reloadBuffered()
         }
         reloadChatMessages()
     }
@@ -224,6 +234,15 @@ class DesktopDatabase(
                 stmt.setString(1, convKey)
                 stmt.executeUpdate()
             }
+        }
+        reloadChatMessages()
+    }
+
+    fun markConversationAsRead(convKey: String) {
+        getConnection().use { conn ->
+            val ps = conn.prepareStatement("UPDATE chat_messages SET status = 'READ' WHERE conv_key = ? AND direction = 'IN' AND status = 'RECEIVED'")
+            ps.setString(1, convKey)
+            ps.executeUpdate()
         }
         reloadChatMessages()
     }
@@ -348,8 +367,26 @@ class DesktopDatabase(
     private fun reloadBuffered() {
         val list = mutableListOf<DtnMessage>()
         getConnection().use { conn ->
+            // First purge any messages that are already confirmed DELIVERED
+            try {
+                conn.createStatement().use { stmt ->
+                    stmt.executeUpdate("""
+                        DELETE FROM messages 
+                        WHERE status != 'BUFFERED' 
+                           OR id IN (SELECT id FROM chat_messages WHERE status = 'DELIVERED')
+                    """.trimIndent())
+                }
+            } catch (_: Exception) {}
+
             conn.createStatement().use { stmt ->
-                val rs = stmt.executeQuery("SELECT * FROM messages WHERE status = 'BUFFERED' ORDER BY created_at_ms ASC")
+                val rs = stmt.executeQuery("""
+                    SELECT m.* FROM messages m 
+                    WHERE m.status = 'BUFFERED' 
+                      AND NOT EXISTS (
+                          SELECT 1 FROM chat_messages c WHERE c.id = m.id AND c.status = 'DELIVERED'
+                      )
+                    ORDER BY m.created_at_ms ASC
+                """.trimIndent())
                 while (rs.next()) {
                     list.add(
                         DtnMessage(

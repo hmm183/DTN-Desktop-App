@@ -43,7 +43,23 @@ fun DiMaxPropSimulationView(
     var simReport by remember { mutableStateOf<SimReport?>(null) }
     var showRawReport by remember { mutableStateOf(false) }
 
+    var isEngineReady by remember { mutableStateOf(simService.isAvailable()) }
+    var isInstallingEngine by remember { mutableStateOf(false) }
+    var installStatusText by remember { mutableStateOf("") }
+
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        if (!simService.isAvailable()) {
+            isInstallingEngine = true
+            installStatusText = "Initializing simulation engine..."
+            val ok = simService.ensureSimulatorInstalled { installStatusText = it }
+            isEngineReady = ok
+            isInstallingEngine = false
+        } else {
+            isEngineReady = true
+        }
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(24.dp),
@@ -67,17 +83,44 @@ fun DiMaxPropSimulationView(
 
                     Surface(
                         shape = DtnShapes.Pill,
-                        color = if (simService.isAvailable()) DtnColors.GreenSoft else DtnColors.OrangeSoft
+                        color = when {
+                            isEngineReady -> DtnColors.GreenSoft
+                            isInstallingEngine -> DtnColors.PrimarySoft
+                            else -> DtnColors.OrangeSoft
+                        }
                     ) {
                         Row(
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(if (simService.isAvailable()) DtnColors.Green else DtnColors.Orange))
+                            if (isInstallingEngine) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(9.dp),
+                                    color = DtnColors.Primary,
+                                    strokeWidth = 2.dp
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier.size(7.dp).clip(CircleShape)
+                                        .background(if (isEngineReady) DtnColors.Green else DtnColors.Orange)
+                                )
+                            }
                             Text(
-                                text = if (simService.isAvailable()) "ONE Engine Ready" else "Simulation Engine Not Found",
-                                style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = if (simService.isAvailable()) DtnColors.GreenText else DtnColors.OrangeText)
+                                text = when {
+                                    isEngineReady -> "ONE Engine Ready"
+                                    isInstallingEngine -> installStatusText.ifBlank { "Installing Simulator..." }
+                                    else -> "Simulation Engine Not Found"
+                                },
+                                style = TextStyle(
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = when {
+                                        isEngineReady -> DtnColors.GreenText
+                                        isInstallingEngine -> DtnColors.Primary
+                                        else -> DtnColors.OrangeText
+                                    }
+                                )
                             )
                         }
                     }
@@ -249,7 +292,7 @@ fun DiMaxPropSimulationView(
                                     }
                                 }
                             },
-                            enabled = !isRunning && simService.isAvailable(),
+                            enabled = !isRunning && isEngineReady,
                             colors = ButtonDefaults.buttonColors(containerColor = DtnColors.AlgoDiMaxProp),
                             shape = DtnShapes.Button,
                             modifier = Modifier.height(44.dp)
@@ -270,13 +313,33 @@ fun DiMaxPropSimulationView(
                                 val proc = simService.launchInteractiveVisualizer(selectedScenario.filename)
                                 statusMessage = if (proc != null) "Launched ONE Simulator GUI window" else "Failed to launch GUI"
                             },
-                            enabled = simService.isAvailable(),
+                            enabled = isEngineReady,
                             shape = DtnShapes.Button,
                             modifier = Modifier.height(44.dp)
                         ) {
                             Icon(Icons.Filled.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(6.dp))
                             Text("Launch ONE Interactive Visualizer (GUI)", style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold))
+                        }
+
+                        if (!isEngineReady && !isInstallingEngine) {
+                            Button(
+                                onClick = {
+                                    scope.launch {
+                                        isInstallingEngine = true
+                                        val ok = simService.ensureSimulatorInstalled { installStatusText = it }
+                                        isEngineReady = ok
+                                        isInstallingEngine = false
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = DtnColors.Primary),
+                                shape = DtnShapes.Button,
+                                modifier = Modifier.height(44.dp)
+                            ) {
+                                Icon(Icons.Filled.Build, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Enable Simulator Engine", style = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.SemiBold))
+                            }
                         }
 
                         if (statusMessage != null) {
