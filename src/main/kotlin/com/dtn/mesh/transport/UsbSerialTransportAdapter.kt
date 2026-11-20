@@ -88,7 +88,10 @@ class UsbSerialTransportAdapter(
 
     private fun tryConnect(port: SerialPort) {
         port.baudRate = 115200
-        port.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, 1000, 1000)
+        // Block on read without timing out every second; 0 means infinite wait until data or disconnect
+        port.setComPortTimeouts(SerialPort.TIMEOUT_READ_SEMI_BLOCKING, 0, 0)
+        port.clearDTR()
+        port.clearRTS()
         if (port.openPort()) {
             activePort = port
             outputStream = port.outputStream
@@ -141,25 +144,47 @@ class UsbSerialTransportAdapter(
     }
 
     private suspend fun readLoop(inputStream: InputStream) {
-        val header = ByteArray(3)
         while (scope.isActive && activePort?.isOpen == true) {
             try {
-                if (!readFully(inputStream, header, 3)) break
-                val type = header[0].toInt() and 0xFF
-                val len = ((header[1].toInt() and 0xFF) shl 8) or (header[2].toInt() and 0xFF)
+                // Seek to next valid frame type (0x01..0x06), discarding line noise or boot text
+                var firstByte = inputStream.read()
+                if (firstByte < 0) {
+                    val avail = activePort?.bytesAvailable() ?: -1
+                    if (avail < 0) {
+                        println("[UsbSerial] Port disconnected")
+                        break
+                    }
+                    delay(50)
+                    continue
+                }
+
+                while (firstByte !in 0x01..0x06 && scope.isActive && activePort?.isOpen == true) {
+                    firstByte = inputStream.read()
+                    if (firstByte < 0 && (activePort?.bytesAvailable() ?: -1 < 0)) break
+                }
+                if (firstByte !in 0x01..0x06) continue
+
+                val type = firstByte
+
+                // Read 2-byte big-endian length
+                val lenBuf = ByteArray(2)
+                if (!readFully(inputStream, lenBuf, 2)) continue
+                val len = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
 
                 if (len < 0 || len > 2048) {
-                    println("[UsbSerial] Invalid frame length $len, resetting connection")
-                    break
+                    println("[UsbSerial] Frame len $len out of bounds for type 0x%02X, discarding".format(type))
+                    continue // Do not disconnect! Discard invalid frame and keep port open
                 }
 
                 val payload = ByteArray(len)
-                if (!readFully(inputStream, payload, len)) break
+                if (!readFully(inputStream, payload, len)) continue
 
                 handleFrame(type, payload)
             } catch (e: Exception) {
-                println("[UsbSerial] Read error: ${e.message}")
-                break
+                if (activePort?.bytesAvailable() ?: -1 < 0) {
+                    println("[UsbSerial] Read error: ${e.message}")
+                    break
+                }
             }
         }
         closePort()
@@ -207,12 +232,17 @@ class UsbSerialTransportAdapter(
 
     private fun readFully(inputStream: InputStream, buf: ByteArray, len: Int): Boolean {
         var read = 0
-        while (read < len) {
+        while (read < len && scope.isActive && activePort?.isOpen == true) {
             val r = inputStream.read(buf, read, len - read)
-            if (r < 0) return false
-            read += r
+            if (r > 0) {
+                read += r
+            } else if (r < 0) {
+                val avail = activePort?.bytesAvailable() ?: -1
+                if (avail < 0) return false
+                Thread.sleep(20)
+            }
         }
-        return true
+        return read == len
     }
 
     private fun closePort() {

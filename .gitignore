@@ -9,5 +9,7 @@ keystore.properties
 *.log
 *.exe
 *.pdb
+bin/
+*.lnk
 tools/**/bin/
 tools/**/obj/

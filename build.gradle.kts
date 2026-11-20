@@ -102,7 +102,7 @@ val buildBleWorker by tasks.registering(Exec::class) {
 val compileSimulator by tasks.registering(Exec::class) {
     workingDir = file("tools/sim-dimaxprop")
     if (System.getProperty("os.name").lowercase().contains("windows")) {
-        commandLine("cmd", "/c", "compile.bat")
+        commandLine("cmd", "/c", "call", ".\\compile.bat")
     } else {
         commandLine("sh", "compile.sh")
     }

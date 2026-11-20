@@ -4,6 +4,7 @@ import com.dtn.mesh.model.DtnMessage
 import com.dtn.mesh.model.NodeId
 import com.dtn.mesh.receiver.DtnWireCodec
 import com.hivemq.client.mqtt.MqttClient
+import com.hivemq.client.mqtt.MqttClientTransportConfig
 import com.hivemq.client.mqtt.mqtt3.Mqtt3AsyncClient
 import com.hivemq.client.mqtt.mqtt3.message.publish.Mqtt3Publish
 import kotlinx.coroutines.CoroutineScope
@@ -17,10 +18,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.handshake.ServerHandshake
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Base64
+import java.util.concurrent.TimeUnit
 
 /**
  * Dual internet relay adapter for Desktop: HiveMQ MQTT + Cloudflare Worker WebSocket.
@@ -48,7 +53,7 @@ class DesktopInternetTransportAdapter(
 
     fun start() {
         scope.launch {
-            connectMqtt()
+            supervisorLoop()
         }
         scope.launch {
             connectWebSocket()
@@ -65,18 +70,48 @@ class DesktopInternetTransportAdapter(
         _isConnected.value = false
     }
 
+    private suspend fun supervisorLoop() {
+        while (scope.isActive) {
+            if (mqttClient == null || !mqttClient!!.state.isConnected) {
+                _isConnected.value = false
+                connectMqtt()
+            }
+            delay(10_000L)
+        }
+    }
+
     private fun connectMqtt() {
         try {
             val willTopic = "dtn/v1/presence/$localTag"
             val willEpoch = System.currentTimeMillis() / 1000L
             val willPayload = "off:$willEpoch".toByteArray(Charsets.US_ASCII)
 
+            // Resolve IPv4 first to bypass broken IPv6 routes on local ISPs
+            val addrs = runCatching { InetAddress.getAllByName(mqttHost).toList() }.getOrDefault(emptyList())
+            val v4 = addrs.firstOrNull { it is Inet4Address }
+
+            val transportConfig = MqttClientTransportConfig.builder().apply {
+                if (v4 != null) {
+                    serverAddress(InetSocketAddress(InetAddress.getByAddress(mqttHost, v4.address), mqttPort))
+                } else {
+                    serverHost(mqttHost)
+                    serverPort(mqttPort)
+                }
+                if (mqttPort == 8883) {
+                    sslWithDefaultConfig()
+                }
+                socketConnectTimeout(5, TimeUnit.SECONDS)
+                mqttConnectTimeout(5, TimeUnit.SECONDS)
+            }.build()
+
             val client = MqttClient.builder()
                 .useMqttVersion3()
                 .identifier("dtn-desktop-$localTag")
-                .serverHost(mqttHost)
-                .serverPort(mqttPort)
-                .useSslWithDefaultConfig()
+                .transportConfig(transportConfig)
+                .addDisconnectedListener {
+                    println("[MqttRelay] Broker disconnected")
+                    _isConnected.value = false
+                }
                 .buildAsync()
 
             client.connectWith()
